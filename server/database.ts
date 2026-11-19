@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type {
   AdminOverview,
@@ -60,13 +61,34 @@ interface DatabaseSchema {
   downloadLogs: DownloadLog[];
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL === '1' ||
+    process.env.VERCEL_ENV ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME
+);
+
+const DATA_DIR = process.env.MAXAGRAM_DATA_DIR
+  ? path.resolve(process.env.MAXAGRAM_DATA_DIR)
+  : IS_SERVERLESS
+    ? path.join(os.tmpdir(), 'maxagram-data')
+    : path.resolve(process.cwd(), 'data');
+
 const DB_FILE = path.join(DATA_DIR, 'maxagram-store.json');
+const REMOTE_KV_KEY = 'maxagram:db:v1';
 
 const COVER_CREATIVE = '/src/assets/images/cover_creative_suite_1795098371414.jpg';
 const COVER_SECURITY = '/src/assets/images/cover_security_vault_1795098371647.jpg';
 const COVER_AUDIO = '/src/assets/images/cover_audio_studio_1795098371788.jpg';
 const COVER_DEV = '/src/assets/images/cover_dev_tools_1795098371181.jpg';
+
+function getRemoteKvConfig(): { url: string; token: string } | null {
+  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (url && token) {
+    return { url: url.replace(/\/+$/, ''), token };
+  }
+  return null;
+}
 
 function createSeedDownloads(): DownloadItem[] {
   const items: Array<Omit<DownloadItem, 'sha256'>> = [
@@ -288,12 +310,23 @@ function createSeedDownloads(): DownloadItem[] {
   }));
 }
 
-function createInitialDatabase(): DatabaseSchema {
-  const sessionSecret =
-    process.env.MAXAGRAM_SESSION_SECRET && process.env.MAXAGRAM_SESSION_SECRET.length >= 16
-      ? process.env.MAXAGRAM_SESSION_SECRET
-      : crypto.randomBytes(32).toString('hex');
+function resolveDefaultSessionSecret(): string {
+  if (process.env.MAXAGRAM_SESSION_SECRET && process.env.MAXAGRAM_SESSION_SECRET.length >= 16) {
+    return process.env.MAXAGRAM_SESSION_SECRET;
+  }
+  if (IS_SERVERLESS) {
+    // Stable fallback across serverless instances until MAXAGRAM_SESSION_SECRET is set in Vercel
+    const seed =
+      process.env.VERCEL_PROJECT_ID ||
+      process.env.VERCEL_PROJECT_PRODUCTION_URL ||
+      'maxagram-vercel-production-fallback';
+    return crypto.createHash('sha256').update(`maxagram-secret:${seed}`).digest('hex');
+  }
+  return crypto.randomBytes(32).toString('hex');
+}
 
+function createInitialDatabase(): DatabaseSchema {
+  const sessionSecret = resolveDefaultSessionSecret();
   const adminEmail = (process.env.MAXAGRAM_ADMIN_EMAIL || 'admin@maxagram.io').trim().toLowerCase();
   const adminPassword = process.env.MAXAGRAM_ADMIN_PASSWORD || 'MaxagramAdmin#2026';
 
@@ -410,6 +443,7 @@ function createInitialDatabase(): DatabaseSchema {
 
 class MaxagramDatabase {
   private data: DatabaseSchema;
+  private dirty = false;
 
   constructor() {
     this.data = this.loadFromDisk();
@@ -437,12 +471,67 @@ class MaxagramDatabase {
   }
 
   private persist(target: DatabaseSchema = this.data): void {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+    this.dirty = true;
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+      const tmpPath = `${DB_FILE}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(target, null, 2), 'utf8');
+      fs.renameSync(tmpPath, DB_FILE);
+    } catch (err) {
+      console.error('Disk persistence warning (in-memory/remote store remains active):', err);
     }
-    const tmpPath = `${DB_FILE}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(target, null, 2), 'utf8');
-    fs.renameSync(tmpPath, DB_FILE);
+  }
+
+  /**
+   * Synchronizes state from Vercel KV / Upstash Redis REST when configured,
+   * enabling shared multi-region persistence across serverless invocations.
+   */
+  public async syncFromRemote(): Promise<void> {
+    const kv = getRemoteKvConfig();
+    if (!kv) return;
+    try {
+      const response = await fetch(`${kv.url}/get/${encodeURIComponent(REMOTE_KV_KEY)}`, {
+        headers: { Authorization: `Bearer ${kv.token}` },
+      });
+      if (!response.ok) return;
+      const body = (await response.json()) as { result?: string | null };
+      if (typeof body?.result === 'string' && body.result.length > 0) {
+        const parsed = JSON.parse(body.result) as DatabaseSchema;
+        if (parsed && Array.isArray(parsed.downloads) && Array.isArray(parsed.registrations)) {
+          this.data = parsed;
+          this.dirty = false;
+        }
+      } else {
+        // Seed remote KV on first Vercel boot
+        await this.flushToRemote(true);
+      }
+    } catch (err) {
+      console.error('Remote KV sync skipped:', err);
+    }
+  }
+
+  public async flushToRemote(force = false): Promise<void> {
+    if (!force && !this.dirty) return;
+    const kv = getRemoteKvConfig();
+    if (!kv) {
+      this.dirty = false;
+      return;
+    }
+    try {
+      await fetch(`${kv.url}/set/${encodeURIComponent(REMOTE_KV_KEY)}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${kv.token}`,
+          'Content-Type': 'text/plain; charset=utf-8',
+        },
+        body: JSON.stringify(this.data),
+      });
+      this.dirty = false;
+    } catch (err) {
+      console.error('Remote KV flush failed:', err);
+    }
   }
 
   public getSessionSecret(): string {
@@ -587,7 +676,6 @@ class MaxagramDatabase {
 
     const trimmedKey = (input.recoveryKey || '').trim().toUpperCase();
 
-    // Path 1: Admin-issued recovery key (works across hardware changes or after admin reset)
     if (trimmedKey.length > 0) {
       if (!record.recoveryCodeHash) {
         return {
@@ -606,7 +694,6 @@ class MaxagramDatabase {
         };
       }
 
-      // Ensure the target device is not already bound to another active account
       const otherBound = this.findRegistrationByDeviceFingerprint(input.currentDeviceFingerprint);
       if (otherBound && otherBound.id !== record.id) {
         return {
@@ -630,7 +717,6 @@ class MaxagramDatabase {
       return { ok: true, record };
     }
 
-    // Path 2: Same hardware-bound device restoring session after clearing browser cookies/storage
     if (record.deviceResetRequired) {
       return {
         ok: false,
