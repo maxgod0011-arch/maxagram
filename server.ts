@@ -1,8 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { createApiApp } from './server/app.ts';
+import { socialHub } from './server/realtime.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const app = createApiApp();
@@ -34,7 +36,10 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = http.createServer(app);
+  socialHub.attach(httpServer);
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`MAXAGRAM server listening on http://0.0.0.0:${PORT}`);
   });
 }

@@ -603,12 +603,12 @@ export function AdminDashboard({ onExitAdmin, onCatalogMutated }: AdminDashboard
                   detail="Active packages in catalog"
                 />
                 <KpiCard
-                  label="Official Access Code"
-                  value="PRE-REWORD"
+                  label="Unique Code Mode"
+                  value="1-Time Unique"
                   monoValue
                   detail={
                     overview.registrationsEnabled
-                      ? 'Registration gate open'
+                      ? `Gate open · ${overview.pendingPreRegistrations} pending activation`
                       : 'Registration gate paused'
                   }
                 />
@@ -621,8 +621,8 @@ export function AdminDashboard({ onExitAdmin, onCatalogMutated }: AdminDashboard
                     Global Registration Gate Control
                   </h2>
                   <p className="mt-1 text-xs text-slate-400 max-w-xl">
-                    Pause or re-open new one-device registrations using the official code
-                    PRE-REWORD. Existing active users remain verified while paused.
+                    Pause or re-open new one-device Pre-Registrations and unique code issuance.
+                    Existing active users remain verified while paused.
                   </p>
                 </div>
                 <button
@@ -669,7 +669,7 @@ export function AdminDashboard({ onExitAdmin, onCatalogMutated }: AdminDashboard
                     type="search"
                     value={regQuery}
                     onChange={(e) => setRegQuery(e.target.value)}
-                    placeholder="Search user name, email, device ID, or platform..."
+                    placeholder="Search user name, email, unique code, device ID, or platform..."
                     className="w-full rounded-lg border border-fuchsia-200/[0.14] bg-[#130F1B] py-2 pl-10 pr-3.5 text-xs text-white placeholder:text-slate-500 focus:border-fuchsia-500 focus:outline-none"
                   />
                 </div>
@@ -730,6 +730,9 @@ export function AdminDashboard({ onExitAdmin, onCatalogMutated }: AdminDashboard
                           <td className="px-5 py-3.5">
                             <p className="font-medium text-white">{reg.fullName}</p>
                             <p className="font-mono text-[11px] text-slate-400">{reg.email}</p>
+                            <p className="mt-0.5 font-mono text-[11px] text-fuchsia-300/90 tabular-nums">
+                              Code: {reg.codeUsed}
+                            </p>
                           </td>
                           <td className="px-4 py-3.5 whitespace-nowrap">
                             {reg.status === 'ACTIVE' ? (

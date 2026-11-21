@@ -1,12 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { motion } from 'motion/react';
 import {
   AlertCircle,
-  ArrowDown,
-  Check,
+  ArrowRight,
   CheckCircle2,
-  Copy,
   KeyRound,
   Lock,
   ShieldCheck,
@@ -17,34 +15,36 @@ import { ApiError, recoverDeviceAccess, registerDevice } from '../lib/api';
 import { BrandLogo } from './BrandLogo';
 import { MediaCover } from './MediaCover';
 
-const OFFICIAL_CODE_DISPLAY = 'PRE-REWORD';
-const HERO_IMAGE = '/src/assets/images/maxagram_hero_vault_1795098370592.jpg';
+const HERO_IMAGE = '/assets/aistudio/file_0000000017d48210b5817b5a0f83d9c5_0436fea8.png';
 
 interface RegistrationPageProps {
   deviceStatus: DeviceCheckResponse;
+  prefilledEmail?: string;
   onRegistered: (registration: PublicRegistration) => void;
   onRecovered: (registration: PublicRegistration) => void;
+  onOpenPreRegistration: () => void;
   onOpenAdmin: () => void;
 }
 
 export function RegistrationPage({
   deviceStatus,
+  prefilledEmail,
   onRegistered,
   onRecovered,
+  onOpenPreRegistration,
   onOpenAdmin,
 }: RegistrationPageProps) {
   const defaultTab =
     deviceStatus.status === 'SESSION_CLEARED_DEVICE_BOUND' ||
     deviceStatus.status === 'DEVICE_MISMATCH'
       ? 'recover'
-      : 'register';
+      : 'activate';
 
-  const [activeTab, setActiveTab] = useState<'register' | 'recover'>(defaultTab);
-  const [preRegUnlocked, setPreRegUnlocked] = useState(false);
+  const [activeTab, setActiveTab] = useState<'activate' | 'recover'>(defaultTab);
 
-  // Registration form fields
+  // Code activation form fields (no code is shown beforehand)
   const [fullName, setFullName] = useState('');
-  const [email, setEmail] = useState('');
+  const [email, setEmail] = useState(prefilledEmail || '');
   const [registrationCode, setRegistrationCode] = useState('');
 
   // Recovery form fields
@@ -52,13 +52,16 @@ export function RegistrationPage({
   const [recoveryKey, setRecoveryKey] = useState('');
 
   // Feedback states
-  const [copied, setCopied] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
-  const nameInputRef = useRef<HTMLInputElement>(null);
-  const formPanelRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (prefilledEmail) {
+      setEmail(prefilledEmail);
+      setActiveTab('activate');
+    }
+  }, [prefilledEmail]);
 
   useEffect(() => {
     if (
@@ -66,58 +69,12 @@ export function RegistrationPage({
       deviceStatus.status === 'DEVICE_MISMATCH'
     ) {
       setActiveTab('recover');
+    } else if (deviceStatus.status === 'PRE_REGISTERED') {
+      setActiveTab('activate');
     }
   }, [deviceStatus.status]);
 
-  async function copyOfficialCode(): Promise<boolean> {
-    try {
-      await navigator.clipboard.writeText(OFFICIAL_CODE_DISPLAY);
-      return true;
-    } catch {
-      try {
-        const textArea = document.createElement('textarea');
-        textArea.value = OFFICIAL_CODE_DISPLAY;
-        textArea.style.position = 'fixed';
-        textArea.style.opacity = '0';
-        document.body.appendChild(textArea);
-        textArea.select();
-        document.execCommand('copy');
-        textArea.remove();
-        return true;
-      } catch {
-        return false;
-      }
-    }
-  }
-
-  async function handleCopyCode() {
-    const ok = await copyOfficialCode();
-    if (ok) {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    }
-  }
-
-  async function handlePreRegistrationClick() {
-    setPreRegUnlocked(true);
-    setActiveTab('register');
-    setErrorMessage(null);
-    setRegistrationCode(OFFICIAL_CODE_DISPLAY);
-    const ok = await copyOfficialCode();
-    if (ok) {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2200);
-    }
-    setSuccessMessage(
-      `Pre-registration code ${OFFICIAL_CODE_DISPLAY} applied and copied. Enter your name and email below to finish registering this device.`
-    );
-    window.setTimeout(() => {
-      formPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      nameInputRef.current?.focus();
-    }, 80);
-  }
-
-  async function handleRegisterSubmit(e: FormEvent) {
+  async function handleActivateSubmit(e: FormEvent) {
     e.preventDefault();
     setErrorMessage(null);
     setSuccessMessage(null);
@@ -125,7 +82,7 @@ export function RegistrationPage({
 
     try {
       const response = await registerDevice({
-        fullName,
+        fullName: fullName.trim() || undefined,
         email,
         registrationCode,
       });
@@ -138,7 +95,7 @@ export function RegistrationPage({
           setActiveTab('recover');
         }
       } else {
-        setErrorMessage('Unable to complete registration. Please check your connection and try again.');
+        setErrorMessage('Unable to verify your unique code. Please check your connection and try again.');
       }
     } finally {
       setSubmitting(false);
@@ -169,6 +126,8 @@ export function RegistrationPage({
     }
   }
 
+  const canStartPreRegistration = deviceStatus.registrationsEnabled;
+
   const statusMeta = (() => {
     switch (deviceStatus.status) {
       case 'DISABLED':
@@ -179,13 +138,21 @@ export function RegistrationPage({
             deviceStatus.message ||
             'Access for this device has been disabled by an administrator.',
         };
+      case 'PRE_REGISTERED':
+        return {
+          label: 'Code Ready · Enter Code to Unlock',
+          tone: 'text-emerald-400',
+          detail:
+            deviceStatus.message ||
+            'Paste your copied Pre-Registration code below to enter MAXAGRAM, or click Pre-Registration anytime to view and copy the official code.',
+        };
       case 'SESSION_CLEARED_DEVICE_BOUND':
         return {
           label: 'Device Previously Registered',
           tone: 'text-amber-400',
           detail:
             deviceStatus.message ||
-            'This device already completed one-time registration. Restore your session under Device Recovery.',
+            'Restore your session under Device Recovery, or click Pre-Registration to retrieve the official registration code.',
         };
       case 'DEVICE_MISMATCH':
         return {
@@ -198,12 +165,12 @@ export function RegistrationPage({
       default:
         return {
           label: deviceStatus.registrationsEnabled
-            ? 'Pending One-Time Registration'
+            ? 'Ready for Pre-Registration'
             : 'Registrations Temporarily Paused',
           tone: deviceStatus.registrationsEnabled ? 'text-fuchsia-400' : 'text-amber-400',
           detail: deviceStatus.registrationsEnabled
-            ? 'Complete one-time registration with the official code to unlock the MAXAGRAM catalog.'
-            : 'New device registrations are currently paused by the administrator.',
+            ? 'Click Pre-Registration to immediately receive and copy your access code, then paste it below to enter MAXAGRAM.'
+            : 'New registrations are currently paused by the administrator.',
         };
     }
   })();
@@ -235,149 +202,71 @@ export function RegistrationPage({
         </div>
       </header>
 
-      <main className="mx-auto flex w-full max-w-[1280px] flex-1 flex-col justify-center px-6 py-10 lg:py-12 space-y-10">
-        {/* Centered Welcome & Pre Registration Focal Action */}
+      <main className="mx-auto flex w-full max-w-[1280px] flex-1 flex-col justify-center px-6 py-10 lg:py-12 space-y-8">
+        {/* Centered Welcome Header */}
         <motion.section
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.26, ease: [0.16, 1, 0.3, 1] }}
+          transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
           className="mx-auto flex w-full max-w-3xl flex-col items-center text-center"
         >
           <p className="text-xs font-medium tracking-wide text-fuchsia-400">
-            Official One-Device Access Portal
+            Official MAXAGRAM Access Portal
           </p>
-          <h1 className="mt-2.5 font-display text-3xl sm:text-5xl font-bold leading-[1.08] tracking-[-0.025em] text-white">
+          <h1 className="mt-2.5 font-display text-3xl sm:text-5xl font-bold leading-[1.08] tracking-[-0.025em] text-white text-balance">
             Welcome to MAXAGRAM
           </h1>
-          <p className="mt-4 max-w-2xl text-[15px] leading-relaxed text-slate-300">
-            Access verified desktop software, creative suites, and security utilities sealed with
-            SHA-256 manifests. Click Pre Registration below to claim your official code and bind
-            your device.
+          <p className="mt-3.5 max-w-2xl text-[15px] leading-relaxed text-slate-300">
+            Click Pre-Registration below to instantly get your access code with a one-click Copy
+            option, then enter it to unlock MAXAGRAM Feed, Stories, Messages, Profiles, and
+            Verified Downloads.
           </p>
-
-          {/* Centered Pre Registration Button + Official Code (PRE-REWORD) */}
-          <div className="mt-7 flex flex-col items-center gap-4">
-            <button
-              type="button"
-              onClick={handlePreRegistrationClick}
-              disabled={!deviceStatus.registrationsEnabled}
-              className="inline-flex items-center justify-center gap-3 rounded-xl bg-fuchsia-600 px-8 py-4 text-base font-semibold text-white shadow-[0_8px_30px_rgba(192,38,211,0.32)] hover:bg-fuchsia-500 active:scale-[0.99] transition-all whitespace-nowrap cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <span>Pre Registration</span>
-              <span aria-hidden="true" className="text-fuchsia-200/70">
-                |
-              </span>
-              <span className="font-mono tracking-[0.08em] text-fuchsia-50">
-                {OFFICIAL_CODE_DISPLAY}
-              </span>
-              <ArrowDown className="h-4 w-4 text-fuchsia-100" />
-            </button>
-
-            <div className="flex flex-wrap items-center justify-center gap-3 text-xs text-slate-300">
-              <span className="text-slate-400">Official Registration Code:</span>
-              <code
-                data-testid="official-registration-code"
-                className="font-mono text-sm font-semibold tracking-[0.08em] text-fuchsia-300 tabular-nums"
-              >
-                {OFFICIAL_CODE_DISPLAY}
-              </code>
-              <span aria-hidden="true" className="text-slate-600">
-                ·
-              </span>
-              <button
-                type="button"
-                onClick={handleCopyCode}
-                className="inline-flex items-center gap-1.5 font-medium text-fuchsia-300 hover:text-fuchsia-200 transition-colors cursor-pointer"
-              >
-                {copied ? (
-                  <>
-                    <Check className="h-3.5 w-3.5 text-emerald-400" />
-                    <span className="text-emerald-400">Code Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="h-3.5 w-3.5" />
-                    <span>Copy Code</span>
-                  </>
-                )}
-              </button>
-            </div>
-
-            {preRegUnlocked ? (
-              <p className="text-xs font-medium text-emerald-400">
-                Code {OFFICIAL_CODE_DISPLAY} loaded into the registration form below.
-              </p>
-            ) : null}
-          </div>
         </motion.section>
 
         {/* Architectural 2-Column Showcase + Verification Form */}
         <div className="grid w-full grid-cols-1 items-stretch gap-8 lg:grid-cols-12 lg:gap-10">
-          {/* Left Visual & Security Overview Column */}
+          {/* Left Visual & Pre-Registration Column */}
           <motion.section
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.28, delay: 0.04, ease: [0.16, 1, 0.3, 1] }}
+            transition={{ duration: 0.26, delay: 0.04, ease: [0.16, 1, 0.3, 1] }}
             className="flex flex-col justify-between rounded-xl border border-fuchsia-200/[0.09] bg-[#130F1B] p-7 sm:p-8 lg:col-span-7"
           >
             <div>
-              <div className="overflow-hidden rounded-lg border border-fuchsia-200/[0.08] relative">
+              <div className="overflow-hidden rounded-lg border border-fuchsia-200/[0.12] bg-[#0B0810]">
                 <MediaCover
                   src={HERO_IMAGE}
-                  alt="MAXAGRAM Obsidian Vault Architecture"
+                  alt="MAXAGRAM App Preview"
                   aspect="16/9"
                 />
-                <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[#0B0810]/90 via-[#1E0A26]/25 to-transparent" />
-                <div className="absolute bottom-4 left-4 right-4 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-200">
-                  <span className="font-medium">One-Device Hardware Verification</span>
-                  <span className="font-mono text-fuchsia-300 tabular-nums">
-                    SHA-256 Signed Archives
-                  </span>
-                </div>
               </div>
 
-              {/* Official Code Strip with Dedicated Copy Button */}
-              <div className="mt-6 flex flex-col gap-4 border-t border-fuchsia-200/[0.08] pt-6 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <p className="text-xs font-medium text-slate-400">
-                    Official Pre-Registration Access Code
-                  </p>
-                  <div className="mt-1.5 flex items-baseline gap-3">
-                    <code className="font-mono text-2xl font-semibold tracking-[0.08em] text-white tabular-nums">
-                      {OFFICIAL_CODE_DISPLAY}
-                    </code>
-                    <span className="text-xs text-fuchsia-300/90">One-time per device</span>
-                  </div>
-                </div>
-
+              {/* Centered Pre-Registration Button Directly Below Image */}
+              <div className="mt-7 flex flex-col items-center text-center">
                 <button
                   type="button"
-                  onClick={handleCopyCode}
-                  className="inline-flex items-center justify-center gap-2 rounded-lg border border-fuchsia-400/30 bg-[#1E142C] px-4 py-2.5 text-sm font-medium text-fuchsia-100 hover:bg-[#2A1B3D] active:scale-[0.99] transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                  onClick={onOpenPreRegistration}
+                  disabled={!canStartPreRegistration}
+                  className="inline-flex items-center justify-center gap-2.5 rounded-lg bg-fuchsia-600 px-8 py-3.5 text-sm sm:text-base font-semibold text-white shadow-[0_8px_28px_rgba(192,38,211,0.3)] hover:bg-fuchsia-500 active:scale-[0.99] transition-all whitespace-nowrap cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {copied ? (
-                    <>
-                      <Check className="h-4 w-4 text-emerald-400" />
-                      <span>Code Copied</span>
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="h-4 w-4 text-fuchsia-400" />
-                      <span>Copy Code</span>
-                    </>
-                  )}
+                  <span>Pre-Registration</span>
+                  <ArrowRight className="h-4 w-4 text-fuchsia-100" />
                 </button>
+                <p className="mt-2.5 max-w-md text-xs leading-relaxed text-slate-400">
+                  Click Pre-Registration anytime to immediately receive your access code with a
+                  one-click Copy option.
+                </p>
               </div>
             </div>
 
-            <div className="mt-6 grid grid-cols-1 gap-4 border-t border-fuchsia-200/[0.07] pt-5 text-xs text-slate-400 sm:grid-cols-3">
+            <div className="mt-8 grid grid-cols-1 gap-4 border-t border-fuchsia-200/[0.08] pt-6 text-xs text-slate-400 sm:grid-cols-3">
               <div className="flex items-start gap-2">
                 <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-fuchsia-400" />
-                <span>Server-verified registration code enforcement</span>
+                <span>Instant code with one-click copy after Pre-Registration</span>
               </div>
               <div className="flex items-start gap-2">
                 <Smartphone className="mt-0.5 h-4 w-4 shrink-0 text-fuchsia-400" />
-                <span>Bound permanently to this device signature</span>
+                <span>Pre-register as many times as needed anytime</span>
               </div>
               <div className="flex items-start gap-2">
                 <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-fuchsia-400" />
@@ -386,12 +275,11 @@ export function RegistrationPage({
             </div>
           </motion.section>
 
-          {/* Right Registration / Recovery Panel */}
+          {/* Right Code Activation / Device Recovery Panel */}
           <motion.section
-            ref={formPanelRef}
             initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.28, delay: 0.08, ease: [0.16, 1, 0.3, 1] }}
+            transition={{ duration: 0.26, delay: 0.08, ease: [0.16, 1, 0.3, 1] }}
             className="flex flex-col justify-between rounded-xl border border-fuchsia-200/[0.09] bg-[#130F1B] p-7 sm:p-8 lg:col-span-5"
           >
             <div>
@@ -417,25 +305,25 @@ export function RegistrationPage({
               {/* Segmented Mode Control */}
               <div
                 role="tablist"
-                aria-label="Registration mode"
+                aria-label="Access verification mode"
                 className="mt-6 grid grid-cols-2 gap-1 rounded-lg bg-[#0B0810] p-1 border border-fuchsia-200/[0.07]"
               >
                 <button
                   type="button"
                   role="tab"
-                  aria-selected={activeTab === 'register'}
+                  aria-selected={activeTab === 'activate'}
                   onClick={() => {
-                    setActiveTab('register');
+                    setActiveTab('activate');
                     setErrorMessage(null);
                     setSuccessMessage(null);
                   }}
                   className={`rounded-md px-3 py-2 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
-                    activeTab === 'register'
+                    activeTab === 'activate'
                       ? 'bg-[#261738] text-white'
                       : 'text-slate-400 hover:text-slate-200'
                   }`}
                 >
-                  New Registration
+                  Activate with Code
                 </button>
                 <button
                   type="button"
@@ -477,22 +365,27 @@ export function RegistrationPage({
                 </div>
               ) : null}
 
-              {/* New Registration Form */}
-              {activeTab === 'register' ? (
-                <form onSubmit={handleRegisterSubmit} className="mt-6 space-y-4">
+              {/* Unique Code Activation Form */}
+              {activeTab === 'activate' ? (
+                <form onSubmit={handleActivateSubmit} className="mt-6 space-y-4">
+                  {deviceStatus.status === 'PRE_REGISTERED' && deviceStatus.maskedEmail ? (
+                    <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3.5 py-2.5 text-xs text-emerald-200">
+                      Pre-registration verified for{' '}
+                      <span className="font-mono text-white">{deviceStatus.maskedEmail}</span>.
+                      Paste your unique code below to enter MAXAGRAM.
+                    </div>
+                  ) : null}
+
                   <div>
                     <label
                       htmlFor="reg-fullname"
                       className="block text-xs font-medium text-slate-300 mb-1.5"
                     >
-                      Full Name
+                      Full Name (optional)
                     </label>
                     <input
-                      ref={nameInputRef}
                       id="reg-fullname"
                       type="text"
-                      required
-                      minLength={2}
                       maxLength={80}
                       autoComplete="name"
                       placeholder="Alex Morgan"
@@ -508,7 +401,7 @@ export function RegistrationPage({
                       htmlFor="reg-email"
                       className="block text-xs font-medium text-slate-300 mb-1.5"
                     >
-                      Account Email
+                      Email Address
                     </label>
                     <input
                       id="reg-email"
@@ -530,11 +423,9 @@ export function RegistrationPage({
                         htmlFor="reg-code"
                         className="block text-xs font-medium text-slate-300"
                       >
-                        Registration Code
+                        Pre-Registration Code
                       </label>
-                      <span className="font-mono text-[11px] text-fuchsia-300/80">
-                        Exact code required
-                      </span>
+                      <span className="text-[11px] text-slate-500">Paste copied code</span>
                     </div>
                     <input
                       id="reg-code"
@@ -542,7 +433,7 @@ export function RegistrationPage({
                       required
                       autoComplete="off"
                       spellCheck={false}
-                      placeholder="Enter PRE-REWORD"
+                      placeholder="Paste your copied code"
                       value={registrationCode}
                       onChange={(e) => setRegistrationCode(e.target.value)}
                       disabled={submitting || !deviceStatus.registrationsEnabled}
@@ -555,8 +446,21 @@ export function RegistrationPage({
                     disabled={submitting || !deviceStatus.registrationsEnabled}
                     className="mt-2 w-full rounded-lg bg-fuchsia-600 px-5 py-3 text-sm font-semibold text-white hover:bg-fuchsia-500 active:scale-[0.99] transition-all disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer"
                   >
-                    {submitting ? 'Verifying & Binding Device...' : 'Register Now'}
+                    {submitting ? 'Verifying Unique Code...' : 'Verify & Enter MAXAGRAM'}
                   </button>
+
+                  {canStartPreRegistration ? (
+                    <p className="pt-1 text-center text-xs text-slate-400">
+                      Don&rsquo;t have a code yet?{' '}
+                      <button
+                        type="button"
+                        onClick={onOpenPreRegistration}
+                        className="font-medium text-fuchsia-400 hover:text-fuchsia-300 underline underline-offset-2 cursor-pointer"
+                      >
+                        Complete Pre-Registration
+                      </button>
+                    </p>
+                  ) : null}
                 </form>
               ) : (
                 /* Admin-Controlled Device Recovery Form */

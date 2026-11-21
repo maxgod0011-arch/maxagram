@@ -1,17 +1,30 @@
 import type {
   AdminOverview,
   AdminRegistrationView,
+  ConversationSummary,
   DeviceCheckResponse,
+  DirectMessage,
   DownloadCategory,
   DownloadFormPayload,
   DownloadItem,
+  FeedPost,
+  PostComment,
+  PostMediaType,
+  PublicPreRegistration,
   PublicRegistration,
   RegistrationStatus,
+  SocialProfile,
+  StoryGroup,
+  StoryItem,
 } from '../../shared/types';
 import { getDeviceSignals } from './device';
 
 const USER_TOKEN_KEY = 'maxagram_session_token';
 const ADMIN_TOKEN_KEY = 'maxagram_admin_token';
+
+export function getStoredUserToken(): string | null {
+  return readStoredToken(USER_TOKEN_KEY);
+}
 
 function readStoredToken(key: string): string | null {
   try {
@@ -115,8 +128,29 @@ export async function checkDeviceRegistration(): Promise<DeviceCheckResponse> {
   return result;
 }
 
+export async function preRegisterDevice(input?: {
+  fullName?: string;
+  email?: string;
+}): Promise<{
+  success: boolean;
+  uniqueCode: string;
+  preRegistration: PublicPreRegistration;
+  message: string;
+}> {
+  const signals = await getDeviceSignals();
+  return apiRequest<{
+    success: boolean;
+    uniqueCode: string;
+    preRegistration: PublicPreRegistration;
+    message: string;
+  }>('/api/auth/pre-register', {
+    method: 'POST',
+    body: { ...(input || {}), signals },
+  });
+}
+
 export async function registerDevice(input: {
-  fullName: string;
+  fullName?: string;
   email: string;
   registrationCode: string;
 }): Promise<{ success: boolean; registration: PublicRegistration; token: string; message: string }> {
@@ -355,5 +389,224 @@ export async function deleteAdminDownload(id: string): Promise<{ success: boolea
   return apiRequest(`/api/admin/downloads/${encodeURIComponent(id)}`, {
     method: 'DELETE',
     includeAdminAuth: true,
+  });
+}
+
+// ============================================================================
+// SOCIAL PLATFORM API CALLS (PROFILES, FEED, LIKES/COMMENTS, STORIES, DMs)
+// ============================================================================
+
+export async function uploadSocialMedia(dataUrl: string): Promise<{
+  mediaUrl: string;
+  mediaType: PostMediaType;
+  bytes: number;
+}> {
+  return apiRequest('/api/social/media', {
+    method: 'POST',
+    body: { dataUrl },
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function fetchProfiles(
+  q?: string
+): Promise<{ profiles: SocialProfile[]; me: SocialProfile | null }> {
+  const qs = q && q.trim() ? `?q=${encodeURIComponent(q.trim())}` : '';
+  return apiRequest(`/api/social/profiles${qs}`, {
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function fetchProfileDetail(
+  userId: string
+): Promise<{ profile: SocialProfile; posts: FeedPost[] }> {
+  return apiRequest(`/api/social/profiles/${encodeURIComponent(userId)}`, {
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function updateMyProfile(patch: {
+  displayName?: string;
+  username?: string;
+  bio?: string;
+  location?: string;
+  website?: string;
+  avatarUrl?: string;
+}): Promise<{ profile: SocialProfile }> {
+  return apiRequest('/api/social/profile', {
+    method: 'PATCH',
+    body: patch,
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function toggleFollowUser(userId: string): Promise<{
+  ok: true;
+  following: boolean;
+  followersCount: number;
+  followingCount: number;
+}> {
+  return apiRequest(`/api/social/profiles/${encodeURIComponent(userId)}/follow`, {
+    method: 'POST',
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function fetchSocialFeed(params?: {
+  filter?: 'all' | 'following' | 'image' | 'video';
+  authorId?: string;
+}): Promise<{ posts: FeedPost[] }> {
+  const query = new URLSearchParams();
+  if (params?.filter && params.filter !== 'all') query.set('filter', params.filter);
+  if (params?.authorId) query.set('authorId', params.authorId);
+  const qs = query.toString();
+  return apiRequest(`/api/social/feed${qs ? `?${qs}` : ''}`, {
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function fetchSocialPostById(postId: string): Promise<{ post: FeedPost }> {
+  return apiRequest(`/api/social/posts/${encodeURIComponent(postId)}`, {
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function createSocialPost(payload: {
+  mediaType: PostMediaType;
+  mediaUrl: string;
+  posterUrl?: string;
+  caption?: string;
+  location?: string;
+}): Promise<{ post: FeedPost }> {
+  return apiRequest('/api/social/posts', {
+    method: 'POST',
+    body: payload,
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function deleteSocialPost(postId: string): Promise<{ success: boolean }> {
+  return apiRequest(`/api/social/posts/${encodeURIComponent(postId)}`, {
+    method: 'DELETE',
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function togglePostLike(
+  postId: string
+): Promise<{ liked: boolean; likesCount: number }> {
+  return apiRequest(`/api/social/posts/${encodeURIComponent(postId)}/like`, {
+    method: 'POST',
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function addPostComment(
+  postId: string,
+  text: string
+): Promise<{ comment: PostComment; commentsCount: number }> {
+  return apiRequest(`/api/social/posts/${encodeURIComponent(postId)}/comments`, {
+    method: 'POST',
+    body: { text },
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function deletePostComment(
+  postId: string,
+  commentId: string
+): Promise<{ success: boolean; commentsCount: number }> {
+  return apiRequest(
+    `/api/social/posts/${encodeURIComponent(postId)}/comments/${encodeURIComponent(commentId)}`,
+    {
+      method: 'DELETE',
+      includeUserAuth: true,
+      includeDeviceHeader: true,
+    }
+  );
+}
+
+export async function fetchStories(): Promise<{ groups: StoryGroup[] }> {
+  return apiRequest('/api/social/stories', {
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function createStory(payload: {
+  mediaType: PostMediaType;
+  mediaUrl: string;
+  caption?: string;
+}): Promise<{ story: StoryItem }> {
+  return apiRequest('/api/social/stories', {
+    method: 'POST',
+    body: payload,
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function viewStory(storyId: string): Promise<{ viewsCount: number }> {
+  return apiRequest(`/api/social/stories/${encodeURIComponent(storyId)}/view`, {
+    method: 'POST',
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function deleteStory(storyId: string): Promise<{ success: boolean }> {
+  return apiRequest(`/api/social/stories/${encodeURIComponent(storyId)}`, {
+    method: 'DELETE',
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function fetchConversations(): Promise<{
+  conversations: ConversationSummary[];
+  totalUnread: number;
+}> {
+  return apiRequest('/api/social/conversations', {
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function fetchConversationMessages(peerId: string): Promise<{
+  conversationId: string;
+  peer: SocialProfile;
+  messages: DirectMessage[];
+}> {
+  return apiRequest(`/api/social/conversations/${encodeURIComponent(peerId)}/messages`, {
+    includeUserAuth: true,
+    includeDeviceHeader: true,
+  });
+}
+
+export async function sendDirectMessage(
+  peerId: string,
+  payload: {
+    text?: string;
+    mediaType?: PostMediaType;
+    mediaUrl?: string;
+    storyRefId?: string;
+  }
+): Promise<{ message: DirectMessage }> {
+  return apiRequest(`/api/social/conversations/${encodeURIComponent(peerId)}/messages`, {
+    method: 'POST',
+    body: payload,
+    includeUserAuth: true,
+    includeDeviceHeader: true,
   });
 }

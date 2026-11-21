@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import express from 'express';
 import type { Express, NextFunction, Request, Response } from 'express';
 import { DOWNLOAD_CATEGORIES } from '../shared/types.ts';
@@ -6,11 +7,13 @@ import type {
   DeviceSignals,
   DownloadCategory,
   DownloadFormPayload,
+  PostMediaType,
 } from '../shared/types.ts';
 import { db } from './database.ts';
+import { resolveUploadedMediaPath, saveUploadedMedia } from './mediaStore.ts';
+import { socialHub } from './realtime.ts';
 import {
   ADMIN_SESSION_COOKIE,
-  OFFICIAL_REGISTRATION_CODE,
   USER_SESSION_COOKIE,
   clearAuthCookie,
   computeServerDeviceFingerprint,
@@ -188,7 +191,7 @@ export function createApiApp(): Express {
   const app = express();
   app.set('trust proxy', 1);
   app.use(securityHeadersMiddleware);
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '16mb' }));
 
   const generalApiLimiter = createRateLimiter({
     windowMs: 60 * 1000,
@@ -304,6 +307,22 @@ export function createApiApp(): Express {
       return;
     }
 
+    const existingPreReg = db.findPreRegistrationByDeviceFingerprint(computed.fingerprint);
+    if (existingPreReg && !existingPreReg.redeemedAt) {
+      const payload: DeviceCheckResponse = {
+        registered: false,
+        status: 'PRE_REGISTERED',
+        registrationsEnabled,
+        deviceIdPreview: existingPreReg.deviceShortId,
+        deviceAlreadyRegistered: false,
+        maskedEmail: existingPreReg.email ? maskEmail(existingPreReg.email) : undefined,
+        message:
+          'Enter your copied Pre-Registration code below to unlock MAXAGRAM, or click Pre-Registration anytime to view and copy the official registration code.',
+      };
+      res.json(payload);
+      return;
+    }
+
     const payload: DeviceCheckResponse = {
       registered: false,
       status: 'UNREGISTERED',
@@ -314,61 +333,21 @@ export function createApiApp(): Express {
     res.json(payload);
   });
 
-  app.post('/api/auth/register', authStrictLimiter, async (req: Request, res: Response) => {
+  app.post('/api/auth/pre-register', async (req: Request, res: Response) => {
     if (!db.isRegistrationsEnabled()) {
       res.status(403).json({
-        error: 'New registrations are currently paused by the MAXAGRAM administrator.',
+        error: 'New pre-registrations are currently paused by the MAXAGRAM administrator.',
       });
       return;
     }
 
-    const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim() : '';
-    const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
-    const registrationCode =
-      typeof req.body?.registrationCode === 'string' ? req.body.registrationCode.trim() : '';
+    const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim().slice(0, 80) : '';
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().slice(0, 120) : '';
     const signals = (req.body?.signals || {}) as Partial<DeviceSignals>;
-
-    if (fullName.length < 2 || fullName.length > 80) {
-      res.status(400).json({ error: 'Please enter your full name (2 to 80 characters).' });
-      return;
-    }
-
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email) || email.length > 120) {
-      res.status(400).json({ error: 'Please enter a valid email address for device binding.' });
-      return;
-    }
-
-    if (registrationCode !== OFFICIAL_REGISTRATION_CODE) {
-      res.status(400).json({
-        error: `Invalid registration code. Only the official code "${OFFICIAL_REGISTRATION_CODE}" is accepted.`,
-      });
-      return;
-    }
 
     const computed = computeServerDeviceFingerprint(req, signals, db.getSessionSecret());
 
-    const existingDevice = db.findRegistrationByDeviceFingerprint(computed.fingerprint);
-    if (existingDevice) {
-      res.status(409).json({
-        error:
-          'This device has already completed its one-time registration. Duplicate registrations are not permitted. Switch to Device Recovery to restore your verified session.',
-        code: 'DUPLICATE_DEVICE',
-      });
-      return;
-    }
-
-    const existingEmail = db.findRegistrationByEmail(email);
-    if (existingEmail) {
-      res.status(409).json({
-        error:
-          'This email address has already redeemed the one-time registration code. Each account may register only once; request admin device recovery if you changed devices.',
-        code: 'DUPLICATE_ACCOUNT',
-      });
-      return;
-    }
-
-    const created = db.createRegistration({
+    const created = db.createPreRegistration({
       fullName,
       email,
       deviceFingerprint: computed.fingerprint,
@@ -379,12 +358,70 @@ export function createApiApp(): Express {
     });
 
     await db.flushToRemote();
-    const token = issueUserSession(req, res, created.id, created.deviceFingerprint);
 
     res.status(201).json({
       success: true,
-      message: 'Registration completed and bound to your device.',
-      registration: db.toPublicRegistration(created),
+      message: 'Successfully Pre-registration! Copy this code',
+      uniqueCode: created.uniqueCode,
+      preRegistration: db.toPublicPreRegistration(created),
+    });
+  });
+
+  app.post('/api/auth/register', authStrictLimiter, async (req: Request, res: Response) => {
+    if (!db.isRegistrationsEnabled()) {
+      res.status(403).json({
+        error: 'New registrations are currently paused by the MAXAGRAM administrator.',
+      });
+      return;
+    }
+
+    const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim().slice(0, 80) : '';
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+    const registrationCode =
+      typeof req.body?.registrationCode === 'string' ? req.body.registrationCode.trim() : '';
+    const signals = (req.body?.signals || {}) as Partial<DeviceSignals>;
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email) || email.length > 120) {
+      res.status(400).json({ error: 'Please enter a valid email address.' });
+      return;
+    }
+
+    if (registrationCode.length < 6) {
+      res.status(400).json({
+        error: 'Enter the code you copied after clicking Pre-Registration.',
+      });
+      return;
+    }
+
+    const computed = computeServerDeviceFingerprint(req, signals, db.getSessionSecret());
+
+    const result = db.redeemPreRegistrationToRegistration({
+      fullName,
+      email,
+      uniqueCode: registrationCode,
+      deviceFingerprint: computed.fingerprint,
+      deviceShortId: computed.shortId,
+      devicePlatform: computed.platform,
+      deviceBrowser: computed.browser,
+      ipAddress: getClientIp(req),
+    });
+
+    if (!result.ok) {
+      res.status(result.statusCode).json({
+        error: result.error,
+        code: result.code,
+      });
+      return;
+    }
+
+    await db.flushToRemote();
+    const token = issueUserSession(req, res, result.record.id, result.record.deviceFingerprint);
+
+    res.status(201).json({
+      success: true,
+      message: 'Registration completed and verified for your device.',
+      registration: db.toPublicRegistration(result.record),
       token,
     });
   });
@@ -544,6 +581,408 @@ export function createApiApp(): Express {
       res.setHeader('X-Maxagram-Downloads', String(updated.downloadsCount));
       res.setHeader('Cache-Control', 'no-store');
       res.send(archive);
+    }
+  );
+
+  // ============================================================================
+  // SOCIAL PLATFORM ROUTES (PROFILES, FEED, LIKES/COMMENTS, STORIES, DIRECT MESSAGES)
+  // ============================================================================
+
+  // Serve uploaded photos & videos with HTTP 206 Range streaming for smooth video playback
+  app.get('/api/social/media/:fileId', (req: Request, res: Response) => {
+    const resolved = resolveUploadedMediaPath(req.params.fileId);
+    if (!resolved) {
+      res.status(404).json({ error: 'Media asset not found.' });
+      return;
+    }
+
+    const stat = fs.statSync(resolved.filePath);
+    const totalSize = stat.size;
+    const rangeHeader = req.headers.range;
+
+    res.setHeader('Content-Type', resolved.contentType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+
+    if (rangeHeader) {
+      const match = rangeHeader.match(/bytes=(\d*)-(\d*)/);
+      if (!match) {
+        res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
+        return;
+      }
+      const start = match[1] ? Number.parseInt(match[1], 10) : 0;
+      const end = match[2] ? Number.parseInt(match[2], 10) : totalSize - 1;
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= totalSize) {
+        res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
+        return;
+      }
+      const clampedEnd = Math.min(end, totalSize - 1);
+      const chunkSize = clampedEnd - start + 1;
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${clampedEnd}/${totalSize}`);
+      res.setHeader('Content-Length', String(chunkSize));
+      fs.createReadStream(resolved.filePath, { start, end: clampedEnd }).pipe(res);
+      return;
+    }
+
+    res.setHeader('Content-Length', String(totalSize));
+    fs.createReadStream(resolved.filePath).pipe(res);
+  });
+
+  app.post('/api/social/media', requireRegisteredUser, (req: AuthenticatedRequest, res: Response) => {
+    const dataUrl = typeof req.body?.dataUrl === 'string' ? req.body.dataUrl : '';
+    if (!dataUrl) {
+      res.status(400).json({ error: 'Missing media payload.' });
+      return;
+    }
+    const saved = saveUploadedMedia({ dataUrl });
+    if (!saved.ok) {
+      res.status(saved.statusCode).json({ error: saved.error });
+      return;
+    }
+    res.status(201).json({
+      mediaUrl: saved.mediaUrl,
+      mediaType: saved.mediaType,
+      bytes: saved.bytes,
+    });
+  });
+
+  app.get('/api/social/profiles', requireRegisteredUser, (req: AuthenticatedRequest, res: Response) => {
+    const viewerId = req.registrationId!;
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    const onlineSet = new Set(socialHub.getOnlineUserIds());
+    const profiles = db.listSocialProfiles(viewerId, q, onlineSet);
+    const me = db.getSocialProfile(viewerId, viewerId, onlineSet);
+    res.json({ profiles, me });
+  });
+
+  app.get(
+    '/api/social/profiles/:userId',
+    requireRegisteredUser,
+    (req: AuthenticatedRequest, res: Response) => {
+      const viewerId = req.registrationId!;
+      const targetId = req.params.userId === 'me' ? viewerId : req.params.userId;
+      const onlineSet = new Set(socialHub.getOnlineUserIds());
+      const profile = db.getSocialProfile(targetId, viewerId, onlineSet);
+      if (!profile) {
+        res.status(404).json({ error: 'Profile not found.' });
+        return;
+      }
+      const posts = db.listFeedPosts(viewerId, { authorId: targetId });
+      res.json({ profile, posts });
+    }
+  );
+
+  app.patch(
+    '/api/social/profile',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const userId = req.registrationId!;
+      const onlineSet = new Set(socialHub.getOnlineUserIds());
+      const result = db.updateSocialProfile(
+        userId,
+        {
+          displayName: typeof req.body?.displayName === 'string' ? req.body.displayName : undefined,
+          username: typeof req.body?.username === 'string' ? req.body.username : undefined,
+          bio: typeof req.body?.bio === 'string' ? req.body.bio : undefined,
+          location: typeof req.body?.location === 'string' ? req.body.location : undefined,
+          website: typeof req.body?.website === 'string' ? req.body.website : undefined,
+          avatarUrl: typeof req.body?.avatarUrl === 'string' ? req.body.avatarUrl : undefined,
+        },
+        onlineSet
+      );
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.broadcastToAll({ type: 'profile:updated', userId });
+      res.json({ profile: result.profile });
+    }
+  );
+
+  app.post(
+    '/api/social/profiles/:userId/follow',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const followerId = req.registrationId!;
+      const targetUserId = req.params.userId;
+      const result = db.toggleFollow(followerId, targetUserId);
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.broadcastToAll({
+        type: 'profile:followed',
+        targetUserId,
+        followerId,
+        following: result.following,
+        followersCount: result.followersCount,
+      });
+      res.json(result);
+    }
+  );
+
+  app.get('/api/social/feed', requireRegisteredUser, (req: AuthenticatedRequest, res: Response) => {
+    const viewerId = req.registrationId!;
+    const rawFilter = typeof req.query.filter === 'string' ? req.query.filter : 'all';
+    const filter =
+      rawFilter === 'following' || rawFilter === 'image' || rawFilter === 'video'
+        ? rawFilter
+        : 'all';
+    const authorId = typeof req.query.authorId === 'string' ? req.query.authorId : undefined;
+    const posts = db.listFeedPosts(viewerId, { filter, authorId });
+    res.json({ posts });
+  });
+
+  app.get(
+    '/api/social/posts/:id',
+    requireRegisteredUser,
+    (req: AuthenticatedRequest, res: Response) => {
+      const post = db.getFeedPostById(req.params.id, req.registrationId!);
+      if (!post) {
+        res.status(404).json({ error: 'Post not found.' });
+        return;
+      }
+      res.json({ post });
+    }
+  );
+
+  app.post(
+    '/api/social/posts',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const authorId = req.registrationId!;
+      const mediaType = req.body?.mediaType as PostMediaType;
+      const mediaUrl = typeof req.body?.mediaUrl === 'string' ? req.body.mediaUrl : '';
+      const posterUrl = typeof req.body?.posterUrl === 'string' ? req.body.posterUrl : undefined;
+      const caption = typeof req.body?.caption === 'string' ? req.body.caption : '';
+      const location = typeof req.body?.location === 'string' ? req.body.location : '';
+
+      const result = db.createPost(authorId, {
+        mediaType,
+        mediaUrl,
+        posterUrl,
+        caption,
+        location,
+      });
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.broadcastToAll({
+        type: 'post:created',
+        postId: result.post.id,
+        authorId,
+      });
+      res.status(201).json({ post: result.post });
+    }
+  );
+
+  app.delete(
+    '/api/social/posts/:id',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const result = db.deletePost(req.params.id, req.registrationId!);
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.broadcastToAll({ type: 'post:deleted', postId: req.params.id });
+      res.json({ success: true });
+    }
+  );
+
+  app.post(
+    '/api/social/posts/:id/like',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const userId = req.registrationId!;
+      const postId = req.params.id;
+      const result = db.togglePostLike(postId, userId);
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.broadcastToAll({
+        type: 'post:liked',
+        postId,
+        likesCount: result.likesCount,
+        userId,
+        liked: result.liked,
+      });
+      res.json({ liked: result.liked, likesCount: result.likesCount });
+    }
+  );
+
+  app.post(
+    '/api/social/posts/:id/comments',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const authorId = req.registrationId!;
+      const postId = req.params.id;
+      const text = typeof req.body?.text === 'string' ? req.body.text : '';
+      const result = db.addPostComment(postId, authorId, text);
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      const { canDelete: _ignored, ...broadcastComment } = result.comment;
+      socialHub.broadcastToAll({
+        type: 'post:commented',
+        postId,
+        comment: broadcastComment,
+        commentsCount: result.commentsCount,
+      });
+      res.status(201).json({ comment: result.comment, commentsCount: result.commentsCount });
+    }
+  );
+
+  app.delete(
+    '/api/social/posts/:id/comments/:commentId',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const postId = req.params.id;
+      const commentId = req.params.commentId;
+      const result = db.deletePostComment(postId, commentId, req.registrationId!);
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.broadcastToAll({
+        type: 'post:comment_deleted',
+        postId,
+        commentId,
+        commentsCount: result.commentsCount,
+      });
+      res.json({ success: true, commentsCount: result.commentsCount });
+    }
+  );
+
+  app.get('/api/social/stories', requireRegisteredUser, (req: AuthenticatedRequest, res: Response) => {
+    const groups = db.listActiveStoryGroups(req.registrationId!);
+    res.json({ groups });
+  });
+
+  app.post(
+    '/api/social/stories',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const authorId = req.registrationId!;
+      const mediaType = req.body?.mediaType as PostMediaType;
+      const mediaUrl = typeof req.body?.mediaUrl === 'string' ? req.body.mediaUrl : '';
+      const caption = typeof req.body?.caption === 'string' ? req.body.caption : '';
+      const result = db.createStory(authorId, { mediaType, mediaUrl, caption });
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.broadcastToAll({
+        type: 'story:created',
+        authorId,
+        storyId: result.story.id,
+      });
+      res.status(201).json({ story: result.story });
+    }
+  );
+
+  app.post(
+    '/api/social/stories/:id/view',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const result = db.markStoryViewed(req.params.id, req.registrationId!);
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      res.json({ viewsCount: result.viewsCount });
+    }
+  );
+
+  app.delete(
+    '/api/social/stories/:id',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const result = db.deleteStory(req.params.id, req.registrationId!);
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.broadcastToAll({ type: 'story:deleted', storyId: req.params.id });
+      res.json({ success: true });
+    }
+  );
+
+  app.get(
+    '/api/social/conversations',
+    requireRegisteredUser,
+    (req: AuthenticatedRequest, res: Response) => {
+      const onlineSet = new Set(socialHub.getOnlineUserIds());
+      const { conversations, totalUnread } = db.listConversations(req.registrationId!, onlineSet);
+      res.json({ conversations, totalUnread });
+    }
+  );
+
+  app.get(
+    '/api/social/conversations/:peerId/messages',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const userId = req.registrationId!;
+      const peerId = req.params.peerId;
+      const onlineSet = new Set(socialHub.getOnlineUserIds());
+      const result = db.getConversationMessages(userId, peerId, onlineSet);
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      if (result.markedReadAt) {
+        await db.flushToRemote();
+        socialHub.sendToUsers([userId, peerId], {
+          type: 'dm:read',
+          conversationId: result.conversationId,
+          readerId: userId,
+          readAt: result.markedReadAt,
+        });
+      }
+      res.json({
+        conversationId: result.conversationId,
+        peer: result.peer,
+        messages: result.messages,
+      });
+    }
+  );
+
+  app.post(
+    '/api/social/conversations/:peerId/messages',
+    requireRegisteredUser,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const senderId = req.registrationId!;
+      const recipientId = req.params.peerId;
+      const result = db.sendDirectMessage(senderId, recipientId, {
+        text: typeof req.body?.text === 'string' ? req.body.text : '',
+        mediaType: req.body?.mediaType as PostMediaType | undefined,
+        mediaUrl: typeof req.body?.mediaUrl === 'string' ? req.body.mediaUrl : undefined,
+        storyRefId: typeof req.body?.storyRefId === 'string' ? req.body.storyRefId : undefined,
+      });
+      if (!result.ok) {
+        res.status(result.statusCode).json({ error: result.error });
+        return;
+      }
+      await db.flushToRemote();
+      socialHub.sendToUsers([senderId, recipientId], {
+        type: 'dm:message',
+        message: result.message,
+      });
+      res.status(201).json({ message: result.message });
     }
   );
 

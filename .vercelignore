@@ -1,6 +1,8 @@
 node_modules
 dist
 data
+.netlify
+netlify
 .env
 .env.local
 .DS_Store

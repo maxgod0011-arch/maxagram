@@ -2,8 +2,6 @@ import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
 import type { DeviceSignals } from '../shared/types.ts';
 
-export const OFFICIAL_REGISTRATION_CODE = 'PRE-REWORD';
-
 export const USER_SESSION_COOKIE = 'maxagram_user_session';
 export const ADMIN_SESSION_COOKIE = 'maxagram_admin_session';
 
@@ -57,6 +55,12 @@ export function generateRecoveryKey(): string {
   return `REC-${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
 }
 
+export const OFFICIAL_REGISTRATION_CODE = 'PRE-REWORD';
+
+export function getOfficialRegistrationCode(): string {
+  return OFFICIAL_REGISTRATION_CODE;
+}
+
 export function generateSha256FromText(input: string): string {
   return crypto.createHash('sha256').update(input).digest('hex');
 }
@@ -69,11 +73,15 @@ export function maskEmail(email: string): string {
 }
 
 export function getClientIp(req: Request): string {
+  const netlifyIp = req.headers['x-nf-client-connection-ip'];
+  if (typeof netlifyIp === 'string' && netlifyIp.length > 0) {
+    return netlifyIp.trim();
+  }
   const forwarded = req.headers['x-forwarded-for'];
   if (typeof forwarded === 'string' && forwarded.length > 0) {
     return forwarded.split(',')[0].trim();
   }
-  return req.socket.remoteAddress || '127.0.0.1';
+  return req.socket?.remoteAddress || '127.0.0.1';
 }
 
 export function computeServerDeviceFingerprint(
@@ -190,7 +198,7 @@ export function isHttpsRequest(req: Request): boolean {
   if (typeof proto === 'string') {
     return proto.split(',')[0].trim().toLowerCase() === 'https';
   }
-  return req.secure;
+  return Boolean(req.secure);
 }
 
 export function setAuthCookie(

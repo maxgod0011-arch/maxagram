@@ -5,12 +5,21 @@ import path from 'node:path';
 import type {
   AdminOverview,
   AdminRegistrationView,
+  ConversationSummary,
+  DirectMessage,
   DownloadCategory,
   DownloadFormPayload,
   DownloadItem,
   DownloadLog,
+  FeedPost,
+  PostComment,
+  PostMediaType,
+  PublicPreRegistration,
   PublicRegistration,
   RegistrationStatus,
+  SocialProfile,
+  StoryGroup,
+  StoryItem,
 } from '../shared/types.ts';
 import {
   OFFICIAL_REGISTRATION_CODE,
@@ -21,6 +30,18 @@ import {
   timingSafeEqualHex,
   verifyPassword,
 } from './security.ts';
+import {
+  buildConversationId,
+  createSeedSocialData,
+} from './socialSeed.ts';
+import type {
+  StoredComment,
+  StoredDirectMessage,
+  StoredFollow,
+  StoredPost,
+  StoredSocialProfile,
+  StoredStory,
+} from './socialSeed.ts';
 
 interface StoredRegistration {
   id: string;
@@ -41,6 +62,21 @@ interface StoredRegistration {
   deviceResetRequired: boolean;
 }
 
+interface StoredPreRegistration {
+  id: string;
+  fullName: string;
+  email: string;
+  emailNormalized: string;
+  uniqueCode: string;
+  deviceFingerprint: string;
+  deviceShortId: string;
+  devicePlatform: string;
+  deviceBrowser: string;
+  ipAddress: string;
+  createdAt: string;
+  redeemedAt: string | null;
+}
+
 interface StoredAdmin {
   id: string;
   email: string;
@@ -56,14 +92,28 @@ interface DatabaseSchema {
     registrationsEnabled: boolean;
   };
   admins: StoredAdmin[];
+  preRegistrations: StoredPreRegistration[];
   registrations: StoredRegistration[];
   downloads: DownloadItem[];
   downloadLogs: DownloadLog[];
+  profiles: StoredSocialProfile[];
+  follows: StoredFollow[];
+  posts: StoredPost[];
+  stories: StoredStory[];
+  messages: StoredDirectMessage[];
+}
+
+export interface RemoteStoreAdapter {
+  read: () => Promise<string | null>;
+  write: (serialized: string) => Promise<void>;
 }
 
 const IS_SERVERLESS = Boolean(
   process.env.VERCEL === '1' ||
     process.env.VERCEL_ENV ||
+    process.env.NETLIFY === 'true' ||
+    process.env.NETLIFY_LOCAL === 'true' ||
+    process.env.SITE_ID ||
     process.env.AWS_LAMBDA_FUNCTION_NAME
 );
 
@@ -315,11 +365,14 @@ function resolveDefaultSessionSecret(): string {
     return process.env.MAXAGRAM_SESSION_SECRET;
   }
   if (IS_SERVERLESS) {
-    // Stable fallback across serverless instances until MAXAGRAM_SESSION_SECRET is set in Vercel
+    // Stable fallback across serverless instances until MAXAGRAM_SESSION_SECRET is configured
     const seed =
       process.env.VERCEL_PROJECT_ID ||
       process.env.VERCEL_PROJECT_PRODUCTION_URL ||
-      'maxagram-vercel-production-fallback';
+      process.env.SITE_ID ||
+      process.env.URL ||
+      process.env.DEPLOY_PRIME_URL ||
+      'maxagram-serverless-production-fallback';
     return crypto.createHash('sha256').update(`maxagram-secret:${seed}`).digest('hex');
   }
   return crypto.randomBytes(32).toString('hex');
@@ -337,7 +390,7 @@ function createInitialDatabase(): DatabaseSchema {
       email: 'elena.vance@studio-nord.io',
       emailNormalized: 'elena.vance@studio-nord.io',
       status: 'ACTIVE',
-      codeUsed: OFFICIAL_REGISTRATION_CODE,
+      codeUsed: 'MXG-7A4C-19E2',
       deviceFingerprint: generateSha256FromText('seed-device-elena-macbook-pro'),
       deviceShortId: 'DEV-7A4C-19E2',
       devicePlatform: 'macOS',
@@ -355,7 +408,7 @@ function createInitialDatabase(): DatabaseSchema {
       email: 'm.chen@aperturelabs.dev',
       emailNormalized: 'm.chen@aperturelabs.dev',
       status: 'ACTIVE',
-      codeUsed: OFFICIAL_REGISTRATION_CODE,
+      codeUsed: 'MXG-3F91-8B04',
       deviceFingerprint: generateSha256FromText('seed-device-marcus-workstation'),
       deviceShortId: 'DEV-3F91-8B04',
       devicePlatform: 'Windows',
@@ -373,7 +426,7 @@ function createInitialDatabase(): DatabaseSchema {
       email: 'sora@kurokawa-audio.jp',
       emailNormalized: 'sora@kurokawa-audio.jp',
       status: 'DISABLED',
-      codeUsed: OFFICIAL_REGISTRATION_CODE,
+      codeUsed: 'MXG-C205-4E7A',
       deviceFingerprint: generateSha256FromText('seed-device-sora-linux-rig'),
       deviceShortId: 'DEV-C205-4E7A',
       devicePlatform: 'Linux',
@@ -420,8 +473,10 @@ function createInitialDatabase(): DatabaseSchema {
     },
   ];
 
+  const socialSeed = createSeedSocialData();
+
   return {
-    version: 1,
+    version: 3,
     sessionSecret,
     settings: {
       registrationsEnabled: true,
@@ -435,18 +490,89 @@ function createInitialDatabase(): DatabaseSchema {
         createdAt: new Date().toISOString(),
       },
     ],
+    preRegistrations: [],
     registrations: seededRegistrations,
     downloads: createSeedDownloads(),
     downloadLogs: seededLogs,
+    profiles: socialSeed.profiles,
+    follows: socialSeed.follows,
+    posts: socialSeed.posts,
+    stories: socialSeed.stories,
+    messages: socialSeed.messages,
   };
 }
 
 class MaxagramDatabase {
   private data: DatabaseSchema;
   private dirty = false;
+  private remoteAdapter: RemoteStoreAdapter | null = null;
 
   constructor() {
     this.data = this.loadFromDisk();
+  }
+
+  public setRemoteAdapter(adapter: RemoteStoreAdapter | null): void {
+    this.remoteAdapter = adapter;
+  }
+
+  private normalizeSnapshot(parsed: DatabaseSchema): DatabaseSchema {
+    if (!Array.isArray(parsed.preRegistrations)) {
+      parsed.preRegistrations = [];
+    }
+
+    const socialSeed = createSeedSocialData();
+    if (!Array.isArray(parsed.profiles) || parsed.profiles.length === 0) {
+      parsed.profiles = socialSeed.profiles;
+    }
+    if (!Array.isArray(parsed.follows)) {
+      parsed.follows = socialSeed.follows;
+    }
+    if (!Array.isArray(parsed.posts)) {
+      parsed.posts = socialSeed.posts;
+    }
+    if (!Array.isArray(parsed.stories)) {
+      parsed.stories = socialSeed.stories;
+    } else {
+      const nowMs = Date.now();
+      const hasAnyActive = parsed.stories.some((s) => new Date(s.expiresAt).getTime() > nowMs);
+      const onlySeedStories =
+        parsed.stories.length > 0 && parsed.stories.every((s) => s.id.startsWith('story-seed-'));
+      if (!hasAnyActive && onlySeedStories) {
+        parsed.stories = socialSeed.stories;
+      }
+    }
+    if (!Array.isArray(parsed.messages)) {
+      parsed.messages = socialSeed.messages;
+    }
+
+    // Backfill social profiles for any registered users who signed up before social features existed
+    for (const reg of parsed.registrations) {
+      if (!parsed.profiles.some((p) => p.userId === reg.id)) {
+        const baseHandle = this.sanitizeUsername(
+          reg.fullName || reg.email.split('@')[0] || 'member'
+        );
+        const existingHandles = new Set(parsed.profiles.map((p) => p.username));
+        let candidate = baseHandle;
+        let suffix = 1;
+        while (existingHandles.has(candidate)) {
+          candidate = `${baseHandle.slice(0, 19)}${suffix}`;
+          suffix += 1;
+        }
+        parsed.profiles.push({
+          userId: reg.id,
+          username: candidate,
+          displayName: reg.fullName,
+          bio: '',
+          location: '',
+          website: '',
+          avatarUrl: '',
+          joinedAt: reg.registeredAt,
+        });
+      }
+    }
+
+    parsed.version = 3;
+    return parsed;
   }
 
   private loadFromDisk(): DatabaseSchema {
@@ -458,7 +584,7 @@ class MaxagramDatabase {
         const raw = fs.readFileSync(DB_FILE, 'utf8');
         const parsed = JSON.parse(raw) as DatabaseSchema;
         if (parsed && Array.isArray(parsed.downloads) && Array.isArray(parsed.registrations)) {
-          return parsed;
+          return this.normalizeSnapshot(parsed);
         }
       }
     } catch (err) {
@@ -485,53 +611,84 @@ class MaxagramDatabase {
   }
 
   /**
-   * Synchronizes state from Vercel KV / Upstash Redis REST when configured,
-   * enabling shared multi-region persistence across serverless invocations.
+   * Synchronizes state from Upstash Redis / Vercel KV REST or a registered
+   * serverless adapter (such as Netlify Blobs), enabling shared persistence
+   * across serverless invocations.
    */
   public async syncFromRemote(): Promise<void> {
     const kv = getRemoteKvConfig();
-    if (!kv) return;
-    try {
-      const response = await fetch(`${kv.url}/get/${encodeURIComponent(REMOTE_KV_KEY)}`, {
-        headers: { Authorization: `Bearer ${kv.token}` },
-      });
-      if (!response.ok) return;
-      const body = (await response.json()) as { result?: string | null };
-      if (typeof body?.result === 'string' && body.result.length > 0) {
-        const parsed = JSON.parse(body.result) as DatabaseSchema;
-        if (parsed && Array.isArray(parsed.downloads) && Array.isArray(parsed.registrations)) {
-          this.data = parsed;
-          this.dirty = false;
+    if (kv) {
+      try {
+        const response = await fetch(`${kv.url}/get/${encodeURIComponent(REMOTE_KV_KEY)}`, {
+          headers: { Authorization: `Bearer ${kv.token}` },
+        });
+        if (!response.ok) return;
+        const body = (await response.json()) as { result?: string | null };
+        if (typeof body?.result === 'string' && body.result.length > 0) {
+          const parsed = JSON.parse(body.result) as DatabaseSchema;
+          if (parsed && Array.isArray(parsed.downloads) && Array.isArray(parsed.registrations)) {
+            this.data = this.normalizeSnapshot(parsed);
+            this.dirty = false;
+          }
+        } else {
+          await this.flushToRemote(true);
         }
-      } else {
-        // Seed remote KV on first Vercel boot
-        await this.flushToRemote(true);
+      } catch (err) {
+        console.error('Remote KV sync skipped:', err);
       }
-    } catch (err) {
-      console.error('Remote KV sync skipped:', err);
+      return;
+    }
+
+    if (this.remoteAdapter) {
+      try {
+        const raw = await this.remoteAdapter.read();
+        if (typeof raw === 'string' && raw.length > 0) {
+          const parsed = JSON.parse(raw) as DatabaseSchema;
+          if (parsed && Array.isArray(parsed.downloads) && Array.isArray(parsed.registrations)) {
+            this.data = this.normalizeSnapshot(parsed);
+            this.dirty = false;
+          }
+        } else {
+          await this.flushToRemote(true);
+        }
+      } catch (err) {
+        console.error('Remote store adapter sync skipped:', err);
+      }
     }
   }
 
   public async flushToRemote(force = false): Promise<void> {
     if (!force && !this.dirty) return;
+
     const kv = getRemoteKvConfig();
-    if (!kv) {
-      this.dirty = false;
+    if (kv) {
+      try {
+        await fetch(`${kv.url}/set/${encodeURIComponent(REMOTE_KV_KEY)}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${kv.token}`,
+            'Content-Type': 'text/plain; charset=utf-8',
+          },
+          body: JSON.stringify(this.data),
+        });
+        this.dirty = false;
+      } catch (err) {
+        console.error('Remote KV flush failed:', err);
+      }
       return;
     }
-    try {
-      await fetch(`${kv.url}/set/${encodeURIComponent(REMOTE_KV_KEY)}`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${kv.token}`,
-          'Content-Type': 'text/plain; charset=utf-8',
-        },
-        body: JSON.stringify(this.data),
-      });
-      this.dirty = false;
-    } catch (err) {
-      console.error('Remote KV flush failed:', err);
+
+    if (this.remoteAdapter) {
+      try {
+        await this.remoteAdapter.write(JSON.stringify(this.data));
+        this.dirty = false;
+      } catch (err) {
+        console.error('Remote store adapter flush failed:', err);
+      }
+      return;
     }
+
+    this.dirty = false;
   }
 
   public getSessionSecret(): string {
@@ -566,34 +723,161 @@ class MaxagramDatabase {
     };
   }
 
-  public findRegistrationById(id: string): StoredRegistration | undefined {
-    return this.data.registrations.find((r) => r.id === id);
+  public toPublicPreRegistration(pre: StoredPreRegistration): PublicPreRegistration {
+    return {
+      id: pre.id,
+      fullName: pre.fullName,
+      email: pre.email,
+      deviceShortId: pre.deviceShortId,
+      devicePlatform: pre.devicePlatform,
+      deviceBrowser: pre.deviceBrowser,
+      createdAt: pre.createdAt,
+      redeemed: Boolean(pre.redeemedAt),
+    };
   }
 
-  public findRegistrationByDeviceFingerprint(fingerprint: string): StoredRegistration | undefined {
-    return this.data.registrations.find((r) => r.deviceFingerprint === fingerprint);
+  public findPreRegistrationByDeviceFingerprint(
+    fingerprint: string
+  ): StoredPreRegistration | undefined {
+    return this.data.preRegistrations.find((p) => p.deviceFingerprint === fingerprint);
   }
 
-  public findRegistrationByEmail(email: string): StoredRegistration | undefined {
+  public findPreRegistrationByEmail(email: string): StoredPreRegistration | undefined {
     const normalized = email.trim().toLowerCase();
-    return this.data.registrations.find((r) => r.emailNormalized === normalized);
+    return this.data.preRegistrations.find((p) => p.emailNormalized === normalized);
   }
 
-  public createRegistration(input: {
-    fullName: string;
-    email: string;
+  public findPreRegistrationByCode(code: string): StoredPreRegistration | undefined {
+    const normalized = code.trim().toUpperCase();
+    return this.data.preRegistrations.find((p) => p.uniqueCode === normalized);
+  }
+
+  public createPreRegistration(input: {
+    fullName?: string;
+    email?: string;
     deviceFingerprint: string;
     deviceShortId: string;
     devicePlatform: string;
     deviceBrowser: string;
     ipAddress: string;
-  }): StoredRegistration {
+  }): StoredPreRegistration {
     const now = new Date().toISOString();
+    const cleanName = (input.fullName || '').trim();
+    const cleanEmail = (input.email || '').trim();
+    const record: StoredPreRegistration = {
+      id: `pre-${crypto.randomUUID()}`,
+      fullName: cleanName,
+      email: cleanEmail,
+      emailNormalized: cleanEmail.toLowerCase(),
+      uniqueCode: OFFICIAL_REGISTRATION_CODE,
+      deviceFingerprint: input.deviceFingerprint,
+      deviceShortId: input.deviceShortId,
+      devicePlatform: input.devicePlatform,
+      deviceBrowser: input.deviceBrowser,
+      ipAddress: input.ipAddress,
+      createdAt: now,
+      redeemedAt: null,
+    };
+    this.data.preRegistrations.unshift(record);
+    if (this.data.preRegistrations.length > 2000) {
+      this.data.preRegistrations = this.data.preRegistrations.slice(0, 2000);
+    }
+    this.persist();
+    return record;
+  }
+
+  private deriveNameFromEmail(email: string): string {
+    const local = email.split('@')[0] || 'MAXAGRAM Member';
+    const words = local
+      .replace(/[._-]+/g, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 3)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1));
+    return words.length > 0 ? words.join(' ') : 'MAXAGRAM Member';
+  }
+
+  public redeemPreRegistrationToRegistration(input: {
+    fullName?: string;
+    email: string;
+    uniqueCode: string;
+    deviceFingerprint: string;
+    deviceShortId: string;
+    devicePlatform: string;
+    deviceBrowser: string;
+    ipAddress: string;
+  }):
+    | { ok: true; record: StoredRegistration }
+    | { ok: false; statusCode: number; error: string; code?: string } {
+    const submittedCode = input.uniqueCode.trim();
+    const normalizedEmail = input.email.trim().toLowerCase();
+
+    if (submittedCode !== OFFICIAL_REGISTRATION_CODE) {
+      return {
+        ok: false,
+        statusCode: 400,
+        error:
+          'Invalid registration code. Only the official code issued via Pre-Registration is accepted.',
+        code: 'INVALID_CODE',
+      };
+    }
+
+    const preReg = this.data.preRegistrations.find(
+      (p) => p.deviceFingerprint === input.deviceFingerprint && !p.redeemedAt
+    );
+
+    const now = new Date().toISOString();
+    const resolvedName =
+      (input.fullName || '').trim() ||
+      preReg?.fullName ||
+      this.deriveNameFromEmail(input.email.trim());
+
+    const existingEmail = this.findRegistrationByEmail(normalizedEmail);
+    if (existingEmail) {
+      if (existingEmail.status !== 'ACTIVE') {
+        return {
+          ok: false,
+          statusCode: 403,
+          error: 'This account registration is currently disabled by an administrator.',
+          code: 'REGISTRATION_DISABLED',
+        };
+      }
+      if (preReg) {
+        preReg.redeemedAt = now;
+        if (!preReg.emailNormalized) {
+          preReg.email = existingEmail.email;
+          preReg.emailNormalized = existingEmail.emailNormalized;
+          preReg.fullName = existingEmail.fullName;
+        }
+      }
+      existingEmail.codeUsed = OFFICIAL_REGISTRATION_CODE;
+      existingEmail.deviceFingerprint = input.deviceFingerprint;
+      existingEmail.deviceShortId = input.deviceShortId;
+      existingEmail.devicePlatform = input.devicePlatform;
+      existingEmail.deviceBrowser = input.deviceBrowser;
+      existingEmail.ipAddress = input.ipAddress;
+      existingEmail.lastVerifiedAt = now;
+      existingEmail.deviceResetRequired = false;
+      this.ensureProfileForRegistration(existingEmail, false);
+      this.persist();
+      return { ok: true, record: existingEmail };
+    }
+
+    if (preReg) {
+      preReg.redeemedAt = now;
+      if (!preReg.emailNormalized) {
+        preReg.email = input.email.trim();
+        preReg.emailNormalized = normalizedEmail;
+        preReg.fullName = resolvedName;
+      }
+    }
+
     const record: StoredRegistration = {
       id: `reg-${crypto.randomUUID()}`,
-      fullName: input.fullName.trim(),
+      fullName: resolvedName,
       email: input.email.trim(),
-      emailNormalized: input.email.trim().toLowerCase(),
+      emailNormalized: normalizedEmail,
       status: 'ACTIVE',
       codeUsed: OFFICIAL_REGISTRATION_CODE,
       deviceFingerprint: input.deviceFingerprint,
@@ -608,8 +892,22 @@ class MaxagramDatabase {
       deviceResetRequired: false,
     };
     this.data.registrations.unshift(record);
+    this.ensureProfileForRegistration(record, false);
     this.persist();
-    return record;
+    return { ok: true, record };
+  }
+
+  public findRegistrationById(id: string): StoredRegistration | undefined {
+    return this.data.registrations.find((r) => r.id === id);
+  }
+
+  public findRegistrationByDeviceFingerprint(fingerprint: string): StoredRegistration | undefined {
+    return this.data.registrations.find((r) => r.deviceFingerprint === fingerprint);
+  }
+
+  public findRegistrationByEmail(email: string): StoredRegistration | undefined {
+    const normalized = email.trim().toLowerCase();
+    return this.data.registrations.find((r) => r.emailNormalized === normalized);
   }
 
   public touchVerification(regId: string, ipAddress?: string): StoredRegistration | undefined {
@@ -741,13 +1039,21 @@ class MaxagramDatabase {
   }
 
   public deleteRegistration(regId: string): boolean {
-    const before = this.data.registrations.length;
+    const target = this.data.registrations.find((r) => r.id === regId);
+    if (!target) return false;
     this.data.registrations = this.data.registrations.filter((r) => r.id !== regId);
-    if (this.data.registrations.length !== before) {
-      this.persist();
-      return true;
-    }
-    return false;
+    this.data.preRegistrations = this.data.preRegistrations.filter(
+      (p) =>
+        p.emailNormalized !== target.emailNormalized &&
+        p.deviceFingerprint !== target.deviceFingerprint
+    );
+    this.data.profiles = this.data.profiles.filter((p) => p.userId !== regId);
+    this.data.follows = this.data.follows.filter(
+      (f) => f.followerId !== regId && f.followingId !== regId
+    );
+    this.data.stories = this.data.stories.filter((s) => s.authorId !== regId);
+    this.persist();
+    return true;
   }
 
   public listRegistrationsForAdmin(filters?: {
@@ -766,6 +1072,7 @@ class MaxagramDatabase {
         return (
           reg.fullName.toLowerCase().includes(q) ||
           reg.email.toLowerCase().includes(q) ||
+          reg.codeUsed.toLowerCase().includes(q) ||
           reg.deviceShortId.toLowerCase().includes(q) ||
           reg.devicePlatform.toLowerCase().includes(q) ||
           reg.deviceBrowser.toLowerCase().includes(q)
@@ -947,6 +1254,7 @@ class MaxagramDatabase {
     const totalUsers = this.data.registrations.length;
     const activeUsers = this.data.registrations.filter((r) => r.status === 'ACTIVE').length;
     const disabledUsers = this.data.registrations.filter((r) => r.status === 'DISABLED').length;
+    const pendingPreRegistrations = this.data.preRegistrations.filter((p) => !p.redeemedAt).length;
     const recoveryPendingCount = this.data.registrations.filter((r) => Boolean(r.recoveryCodeHash)).length;
     const totalDownloads = this.data.downloads.reduce((sum, d) => sum + d.downloadsCount, 0);
 
@@ -954,12 +1262,769 @@ class MaxagramDatabase {
       totalUsers,
       activeUsers,
       disabledUsers,
+      pendingPreRegistrations,
       recoveryPendingCount,
       totalDownloads,
       totalFiles: this.data.downloads.length,
       registrationsEnabled: this.data.settings.registrationsEnabled,
       recentLogs: this.data.downloadLogs.slice(0, 25),
     };
+  }
+
+  // ============================================================================
+  // SOCIAL PLATFORM: PROFILES, FOLLOWS, FEED POSTS, LIKES, COMMENTS, STORIES, DMs
+  // ============================================================================
+
+  private sanitizeUsername(raw: string): string {
+    const cleaned = raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._]+/g, '.')
+      .replace(/\.{2,}/g, '.')
+      .replace(/^\.+|\.+$/g, '')
+      .slice(0, 24);
+    if (cleaned.length >= 3) return cleaned;
+    return `member.${crypto.randomBytes(2).toString('hex')}`;
+  }
+
+  private allocateUniqueUsername(base: string, excludeUserId?: string): string {
+    const sanitized = this.sanitizeUsername(base);
+    const taken = new Set(
+      this.data.profiles
+        .filter((p) => p.userId !== excludeUserId)
+        .map((p) => p.username.toLowerCase())
+    );
+    if (!taken.has(sanitized)) return sanitized;
+    for (let i = 1; i <= 999; i += 1) {
+      const candidate = `${sanitized.slice(0, 20)}${i}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+    return `user.${crypto.randomBytes(3).toString('hex')}`;
+  }
+
+  private isSafeMediaUrl(url: string, allowHttps = false): boolean {
+    if (!url) return false;
+    if (url.startsWith('/api/social/media/') || url.startsWith('/src/assets/')) return true;
+    if (url.startsWith('data:image/') || url.startsWith('data:video/')) return true;
+    if (allowHttps && /^https:\/\//i.test(url)) return true;
+    return false;
+  }
+
+  public ensureProfileForRegistration(
+    reg: StoredRegistration,
+    persistIfCreated = true
+  ): StoredSocialProfile {
+    const existing = this.data.profiles.find((p) => p.userId === reg.id);
+    if (existing) return existing;
+
+    const created: StoredSocialProfile = {
+      userId: reg.id,
+      username: this.allocateUniqueUsername(reg.fullName || reg.email.split('@')[0] || 'member'),
+      displayName: reg.fullName,
+      bio: '',
+      location: '',
+      website: '',
+      avatarUrl: '',
+      joinedAt: reg.registeredAt,
+    };
+    this.data.profiles.push(created);
+    if (persistIfCreated) {
+      this.persist();
+    }
+    return created;
+  }
+
+  private resolveProfileRecord(userId: string): StoredSocialProfile | null {
+    const existing = this.data.profiles.find((p) => p.userId === userId);
+    if (existing) return existing;
+    const reg = this.findRegistrationById(userId);
+    if (reg) {
+      return this.ensureProfileForRegistration(reg, true);
+    }
+    return null;
+  }
+
+  private toPublicProfile(
+    profile: StoredSocialProfile,
+    viewerId: string,
+    onlineUserIds?: ReadonlySet<string>
+  ): SocialProfile {
+    const followersCount = this.data.follows.filter((f) => f.followingId === profile.userId).length;
+    const followingCount = this.data.follows.filter((f) => f.followerId === profile.userId).length;
+    const postsCount = this.data.posts.filter((p) => p.authorId === profile.userId).length;
+    const isFollowing = this.data.follows.some(
+      (f) => f.followerId === viewerId && f.followingId === profile.userId
+    );
+    return {
+      userId: profile.userId,
+      username: profile.username,
+      displayName: profile.displayName,
+      bio: profile.bio,
+      location: profile.location,
+      website: profile.website,
+      avatarUrl: profile.avatarUrl,
+      joinedAt: profile.joinedAt,
+      followersCount,
+      followingCount,
+      postsCount,
+      isFollowing,
+      isSelf: profile.userId === viewerId,
+      isOnline: onlineUserIds ? onlineUserIds.has(profile.userId) : false,
+    };
+  }
+
+  public getSocialProfile(
+    targetUserId: string,
+    viewerId: string,
+    onlineUserIds?: ReadonlySet<string>
+  ): SocialProfile | null {
+    const record = this.resolveProfileRecord(targetUserId);
+    if (!record) return null;
+    return this.toPublicProfile(record, viewerId, onlineUserIds);
+  }
+
+  public listSocialProfiles(
+    viewerId: string,
+    query?: string,
+    onlineUserIds?: ReadonlySet<string>
+  ): SocialProfile[] {
+    // Ensure every registered user has a profile
+    let createdAny = false;
+    for (const reg of this.data.registrations) {
+      if (!this.data.profiles.some((p) => p.userId === reg.id)) {
+        this.ensureProfileForRegistration(reg, false);
+        createdAny = true;
+      }
+    }
+    if (createdAny) {
+      this.persist();
+    }
+
+    const q = (query || '').trim().toLowerCase();
+    return this.data.profiles
+      .filter((p) => {
+        if (!q) return true;
+        return (
+          p.displayName.toLowerCase().includes(q) ||
+          p.username.toLowerCase().includes(q) ||
+          p.bio.toLowerCase().includes(q) ||
+          p.location.toLowerCase().includes(q)
+        );
+      })
+      .map((p) => this.toPublicProfile(p, viewerId, onlineUserIds))
+      .sort((a, b) => {
+        if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1;
+        if (b.followersCount !== a.followersCount) return b.followersCount - a.followersCount;
+        return a.displayName.localeCompare(b.displayName);
+      });
+  }
+
+  public updateSocialProfile(
+    userId: string,
+    patch: {
+      displayName?: string;
+      username?: string;
+      bio?: string;
+      location?: string;
+      website?: string;
+      avatarUrl?: string;
+    },
+    onlineUserIds?: ReadonlySet<string>
+  ): { ok: true; profile: SocialProfile } | { ok: false; statusCode: number; error: string } {
+    const record = this.resolveProfileRecord(userId);
+    if (!record) {
+      return { ok: false, statusCode: 404, error: 'Profile not found.' };
+    }
+
+    if (typeof patch.displayName === 'string') {
+      const name = patch.displayName.trim();
+      if (name.length < 2 || name.length > 60) {
+        return {
+          ok: false,
+          statusCode: 400,
+          error: 'Display name must be between 2 and 60 characters.',
+        };
+      }
+      record.displayName = name;
+    }
+
+    if (typeof patch.username === 'string') {
+      const uname = patch.username.trim().toLowerCase();
+      if (!/^[a-z0-9._]{3,24}$/.test(uname)) {
+        return {
+          ok: false,
+          statusCode: 400,
+          error: 'Username must be 3–24 characters using lowercase letters, numbers, dots, or underscores.',
+        };
+      }
+      const conflict = this.data.profiles.find(
+        (p) => p.userId !== userId && p.username.toLowerCase() === uname
+      );
+      if (conflict) {
+        return {
+          ok: false,
+          statusCode: 409,
+          error: `Username @${uname} is already taken.`,
+        };
+      }
+      record.username = uname;
+    }
+
+    if (typeof patch.bio === 'string') {
+      const bio = patch.bio.trim();
+      if (bio.length > 280) {
+        return { ok: false, statusCode: 400, error: 'Bio must be 280 characters or fewer.' };
+      }
+      record.bio = bio;
+    }
+
+    if (typeof patch.location === 'string') {
+      record.location = patch.location.trim().slice(0, 80);
+    }
+
+    if (typeof patch.website === 'string') {
+      record.website = patch.website.trim().slice(0, 120);
+    }
+
+    if (typeof patch.avatarUrl === 'string') {
+      const trimmed = patch.avatarUrl.trim();
+      if (trimmed.length > 0 && !this.isSafeMediaUrl(trimmed, true)) {
+        return { ok: false, statusCode: 400, error: 'Invalid avatar image URL.' };
+      }
+      record.avatarUrl = trimmed;
+    }
+
+    this.persist();
+    return {
+      ok: true,
+      profile: this.toPublicProfile(record, userId, onlineUserIds),
+    };
+  }
+
+  public toggleFollow(
+    followerId: string,
+    targetUserId: string
+  ):
+    | { ok: true; following: boolean; followersCount: number; followingCount: number }
+    | { ok: false; statusCode: number; error: string } {
+    if (followerId === targetUserId) {
+      return { ok: false, statusCode: 400, error: 'You cannot follow your own profile.' };
+    }
+    const target = this.resolveProfileRecord(targetUserId);
+    if (!target) {
+      return { ok: false, statusCode: 404, error: 'Target profile not found.' };
+    }
+
+    const idx = this.data.follows.findIndex(
+      (f) => f.followerId === followerId && f.followingId === targetUserId
+    );
+    let following: boolean;
+    if (idx >= 0) {
+      this.data.follows.splice(idx, 1);
+      following = false;
+    } else {
+      this.data.follows.push({
+        followerId,
+        followingId: targetUserId,
+        createdAt: new Date().toISOString(),
+      });
+      following = true;
+    }
+
+    this.persist();
+    const followersCount = this.data.follows.filter((f) => f.followingId === targetUserId).length;
+    const followingCount = this.data.follows.filter((f) => f.followerId === followerId).length;
+    return { ok: true, following, followersCount, followingCount };
+  }
+
+  private toPublicComment(
+    comment: StoredComment,
+    postAuthorId: string,
+    viewerId: string
+  ): PostComment {
+    const author = this.resolveProfileRecord(comment.authorId);
+    return {
+      id: comment.id,
+      postId: comment.postId,
+      authorId: comment.authorId,
+      authorName: author?.displayName || 'MAXAGRAM Member',
+      authorUsername: author?.username || 'member',
+      authorAvatar: author?.avatarUrl || '',
+      text: comment.text,
+      createdAt: comment.createdAt,
+      canDelete: comment.authorId === viewerId || postAuthorId === viewerId,
+    };
+  }
+
+  private toPublicPost(post: StoredPost, viewerId: string): FeedPost {
+    const author = this.resolveProfileRecord(post.authorId);
+    return {
+      id: post.id,
+      authorId: post.authorId,
+      authorName: author?.displayName || 'MAXAGRAM Member',
+      authorUsername: author?.username || 'member',
+      authorAvatar: author?.avatarUrl || '',
+      mediaType: post.mediaType,
+      mediaUrl: post.mediaUrl,
+      posterUrl: post.posterUrl,
+      caption: post.caption,
+      location: post.location,
+      likesCount: post.likedBy.length,
+      likedByMe: post.likedBy.includes(viewerId),
+      commentsCount: post.comments.length,
+      comments: post.comments.map((c) => this.toPublicComment(c, post.authorId, viewerId)),
+      createdAt: post.createdAt,
+      canDelete: post.authorId === viewerId,
+    };
+  }
+
+  public listFeedPosts(
+    viewerId: string,
+    options?: {
+      filter?: 'all' | 'following' | 'image' | 'video';
+      authorId?: string;
+    }
+  ): FeedPost[] {
+    const filter = options?.filter || 'all';
+    const authorId = options?.authorId?.trim();
+    const followingSet = new Set(
+      this.data.follows.filter((f) => f.followerId === viewerId).map((f) => f.followingId)
+    );
+
+    return this.data.posts
+      .filter((post) => {
+        if (authorId && post.authorId !== authorId) return false;
+        if (filter === 'following') {
+          return post.authorId === viewerId || followingSet.has(post.authorId);
+        }
+        if (filter === 'image') return post.mediaType === 'image';
+        if (filter === 'video') return post.mediaType === 'video';
+        return true;
+      })
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .map((post) => this.toPublicPost(post, viewerId));
+  }
+
+  public getFeedPostById(postId: string, viewerId: string): FeedPost | null {
+    const post = this.data.posts.find((p) => p.id === postId);
+    if (!post) return null;
+    return this.toPublicPost(post, viewerId);
+  }
+
+  public createPost(
+    authorId: string,
+    input: {
+      mediaType: PostMediaType;
+      mediaUrl: string;
+      posterUrl?: string;
+      caption?: string;
+      location?: string;
+    }
+  ): { ok: true; post: FeedPost } | { ok: false; statusCode: number; error: string } {
+    if (input.mediaType !== 'image' && input.mediaType !== 'video') {
+      return { ok: false, statusCode: 400, error: 'Media type must be image or video.' };
+    }
+    const mediaUrl = (input.mediaUrl || '').trim();
+    if (!this.isSafeMediaUrl(mediaUrl, false)) {
+      return { ok: false, statusCode: 400, error: 'Please upload a valid photo or video first.' };
+    }
+    const posterUrl = input.posterUrl?.trim();
+    if (posterUrl && !this.isSafeMediaUrl(posterUrl, false)) {
+      return { ok: false, statusCode: 400, error: 'Invalid video preview thumbnail.' };
+    }
+    const caption = (input.caption || '').trim().slice(0, 1000);
+    const location = (input.location || '').trim().slice(0, 80);
+
+    this.resolveProfileRecord(authorId);
+
+    const record: StoredPost = {
+      id: `post-${crypto.randomUUID()}`,
+      authorId,
+      mediaType: input.mediaType,
+      mediaUrl,
+      posterUrl: posterUrl || undefined,
+      caption,
+      location,
+      likedBy: [],
+      comments: [],
+      createdAt: new Date().toISOString(),
+    };
+    this.data.posts.unshift(record);
+    this.persist();
+    return { ok: true, post: this.toPublicPost(record, authorId) };
+  }
+
+  public deletePost(
+    postId: string,
+    userId: string
+  ): { ok: true } | { ok: false; statusCode: number; error: string } {
+    const post = this.data.posts.find((p) => p.id === postId);
+    if (!post) {
+      return { ok: false, statusCode: 404, error: 'Post not found.' };
+    }
+    if (post.authorId !== userId) {
+      return { ok: false, statusCode: 403, error: 'You can only delete your own posts.' };
+    }
+    this.data.posts = this.data.posts.filter((p) => p.id !== postId);
+    this.persist();
+    return { ok: true };
+  }
+
+  public togglePostLike(
+    postId: string,
+    userId: string
+  ): { ok: true; liked: boolean; likesCount: number } | { ok: false; statusCode: number; error: string } {
+    const post = this.data.posts.find((p) => p.id === postId);
+    if (!post) {
+      return { ok: false, statusCode: 404, error: 'Post not found.' };
+    }
+    const idx = post.likedBy.indexOf(userId);
+    let liked: boolean;
+    if (idx >= 0) {
+      post.likedBy.splice(idx, 1);
+      liked = false;
+    } else {
+      post.likedBy.push(userId);
+      liked = true;
+    }
+    this.persist();
+    return { ok: true, liked, likesCount: post.likedBy.length };
+  }
+
+  public addPostComment(
+    postId: string,
+    authorId: string,
+    text: string
+  ):
+    | { ok: true; comment: PostComment; commentsCount: number }
+    | { ok: false; statusCode: number; error: string } {
+    const post = this.data.posts.find((p) => p.id === postId);
+    if (!post) {
+      return { ok: false, statusCode: 404, error: 'Post not found.' };
+    }
+    const trimmed = text.trim();
+    if (trimmed.length === 0 || trimmed.length > 500) {
+      return { ok: false, statusCode: 400, error: 'Comment must be between 1 and 500 characters.' };
+    }
+    this.resolveProfileRecord(authorId);
+    const stored: StoredComment = {
+      id: `cmt-${crypto.randomUUID()}`,
+      postId: post.id,
+      authorId,
+      text: trimmed,
+      createdAt: new Date().toISOString(),
+    };
+    post.comments.push(stored);
+    this.persist();
+    return {
+      ok: true,
+      comment: this.toPublicComment(stored, post.authorId, authorId),
+      commentsCount: post.comments.length,
+    };
+  }
+
+  public deletePostComment(
+    postId: string,
+    commentId: string,
+    userId: string
+  ): { ok: true; commentsCount: number } | { ok: false; statusCode: number; error: string } {
+    const post = this.data.posts.find((p) => p.id === postId);
+    if (!post) {
+      return { ok: false, statusCode: 404, error: 'Post not found.' };
+    }
+    const comment = post.comments.find((c) => c.id === commentId);
+    if (!comment) {
+      return { ok: false, statusCode: 404, error: 'Comment not found.' };
+    }
+    if (comment.authorId !== userId && post.authorId !== userId) {
+      return { ok: false, statusCode: 403, error: 'You cannot delete this comment.' };
+    }
+    post.comments = post.comments.filter((c) => c.id !== commentId);
+    this.persist();
+    return { ok: true, commentsCount: post.comments.length };
+  }
+
+  private toPublicStory(story: StoredStory, viewerId: string): StoryItem {
+    const author = this.resolveProfileRecord(story.authorId);
+    return {
+      id: story.id,
+      authorId: story.authorId,
+      authorName: author?.displayName || 'MAXAGRAM Member',
+      authorUsername: author?.username || 'member',
+      authorAvatar: author?.avatarUrl || '',
+      mediaType: story.mediaType,
+      mediaUrl: story.mediaUrl,
+      caption: story.caption,
+      createdAt: story.createdAt,
+      expiresAt: story.expiresAt,
+      viewsCount: story.viewedBy.length,
+      viewedByMe: story.viewedBy.includes(viewerId),
+      canDelete: story.authorId === viewerId,
+    };
+  }
+
+  public listActiveStoryGroups(viewerId: string): StoryGroup[] {
+    const nowMs = Date.now();
+    const activeStories = this.data.stories.filter(
+      (s) => new Date(s.expiresAt).getTime() > nowMs
+    );
+
+    const grouped = new Map<string, StoredStory[]>();
+    for (const story of activeStories) {
+      const list = grouped.get(story.authorId) || [];
+      list.push(story);
+      grouped.set(story.authorId, list);
+    }
+
+    const groups: Array<{ group: StoryGroup; latestMs: number }> = [];
+    for (const [authorId, list] of grouped.entries()) {
+      list.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      const publicItems = list.map((s) => this.toPublicStory(s, viewerId));
+      const author = this.resolveProfileRecord(authorId);
+      const latestMs = new Date(list[list.length - 1].createdAt).getTime();
+      const hasUnseen = publicItems.some((s) => !s.viewedByMe);
+
+      groups.push({
+        latestMs,
+        group: {
+          authorId,
+          authorName: author?.displayName || 'MAXAGRAM Member',
+          authorUsername: author?.username || 'member',
+          authorAvatar: author?.avatarUrl || '',
+          hasUnseen,
+          stories: publicItems,
+        },
+      });
+    }
+
+    groups.sort((a, b) => {
+      const aSelf = a.group.authorId === viewerId;
+      const bSelf = b.group.authorId === viewerId;
+      if (aSelf !== bSelf) return aSelf ? -1 : 1;
+      if (a.group.hasUnseen !== b.group.hasUnseen) return a.group.hasUnseen ? -1 : 1;
+      return b.latestMs - a.latestMs;
+    });
+
+    return groups.map((g) => g.group);
+  }
+
+  public createStory(
+    authorId: string,
+    input: { mediaType: PostMediaType; mediaUrl: string; caption?: string }
+  ): { ok: true; story: StoryItem } | { ok: false; statusCode: number; error: string } {
+    if (input.mediaType !== 'image' && input.mediaType !== 'video') {
+      return { ok: false, statusCode: 400, error: 'Story media must be a photo or video.' };
+    }
+    const mediaUrl = (input.mediaUrl || '').trim();
+    if (!this.isSafeMediaUrl(mediaUrl, false)) {
+      return { ok: false, statusCode: 400, error: 'Please upload a valid photo or video for your story.' };
+    }
+    const caption = (input.caption || '').trim().slice(0, 220);
+    this.resolveProfileRecord(authorId);
+
+    const now = Date.now();
+    const record: StoredStory = {
+      id: `story-${crypto.randomUUID()}`,
+      authorId,
+      mediaType: input.mediaType,
+      mediaUrl,
+      caption,
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+      viewedBy: [authorId],
+    };
+    this.data.stories.push(record);
+    this.persist();
+    return { ok: true, story: this.toPublicStory(record, authorId) };
+  }
+
+  public markStoryViewed(
+    storyId: string,
+    viewerId: string
+  ): { ok: true; viewsCount: number } | { ok: false; statusCode: number; error: string } {
+    const story = this.data.stories.find((s) => s.id === storyId);
+    if (!story) {
+      return { ok: false, statusCode: 404, error: 'Story not found.' };
+    }
+    if (!story.viewedBy.includes(viewerId)) {
+      story.viewedBy.push(viewerId);
+      this.persist();
+    }
+    return { ok: true, viewsCount: story.viewedBy.length };
+  }
+
+  public deleteStory(
+    storyId: string,
+    userId: string
+  ): { ok: true } | { ok: false; statusCode: number; error: string } {
+    const story = this.data.stories.find((s) => s.id === storyId);
+    if (!story) {
+      return { ok: false, statusCode: 404, error: 'Story not found.' };
+    }
+    if (story.authorId !== userId) {
+      return { ok: false, statusCode: 403, error: 'You can only delete your own stories.' };
+    }
+    this.data.stories = this.data.stories.filter((s) => s.id !== storyId);
+    this.persist();
+    return { ok: true };
+  }
+
+  public listConversations(
+    userId: string,
+    onlineUserIds?: ReadonlySet<string>
+  ): { conversations: ConversationSummary[]; totalUnread: number } {
+    const byPeer = new Map<
+      string,
+      { lastMessage: StoredDirectMessage; unreadCount: number; conversationId: string }
+    >();
+
+    for (const msg of this.data.messages) {
+      if (msg.senderId !== userId && msg.recipientId !== userId) continue;
+      const peerId = msg.senderId === userId ? msg.recipientId : msg.senderId;
+      const existing = byPeer.get(peerId);
+      const isUnread = msg.recipientId === userId && msg.readAt === null;
+
+      if (!existing) {
+        byPeer.set(peerId, {
+          conversationId: msg.conversationId,
+          lastMessage: msg,
+          unreadCount: isUnread ? 1 : 0,
+        });
+      } else {
+        if (isUnread) existing.unreadCount += 1;
+        if (new Date(msg.createdAt).getTime() >= new Date(existing.lastMessage.createdAt).getTime()) {
+          existing.lastMessage = msg;
+        }
+      }
+    }
+
+    const conversations: ConversationSummary[] = [];
+    let totalUnread = 0;
+    for (const [peerId, entry] of byPeer.entries()) {
+      const peerProfile = this.getSocialProfile(peerId, userId, onlineUserIds);
+      if (!peerProfile) continue;
+      totalUnread += entry.unreadCount;
+      conversations.push({
+        conversationId: entry.conversationId,
+        peer: peerProfile,
+        lastMessage: { ...entry.lastMessage },
+        unreadCount: entry.unreadCount,
+        updatedAt: entry.lastMessage.createdAt,
+      });
+    }
+
+    conversations.sort(
+      (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+    );
+
+    return { conversations, totalUnread };
+  }
+
+  public getConversationMessages(
+    userId: string,
+    peerId: string,
+    onlineUserIds?: ReadonlySet<string>
+  ):
+    | {
+        ok: true;
+        conversationId: string;
+        peer: SocialProfile;
+        messages: DirectMessage[];
+        markedReadAt: string | null;
+      }
+    | { ok: false; statusCode: number; error: string } {
+    if (userId === peerId) {
+      return { ok: false, statusCode: 400, error: 'Select another member to start a conversation.' };
+    }
+    const peer = this.getSocialProfile(peerId, userId, onlineUserIds);
+    if (!peer) {
+      return { ok: false, statusCode: 404, error: 'Recipient profile not found.' };
+    }
+
+    const conversationId = buildConversationId(userId, peerId);
+    const nowIso = new Date().toISOString();
+    let markedAny = false;
+
+    const messages = this.data.messages
+      .filter((m) => m.conversationId === conversationId)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+      .map((m) => {
+        if (m.recipientId === userId && m.readAt === null) {
+          m.readAt = nowIso;
+          markedAny = true;
+        }
+        return { ...m };
+      });
+
+    if (markedAny) {
+      this.persist();
+    }
+
+    return {
+      ok: true,
+      conversationId,
+      peer,
+      messages,
+      markedReadAt: markedAny ? nowIso : null,
+    };
+  }
+
+  public sendDirectMessage(
+    senderId: string,
+    recipientId: string,
+    input: {
+      text?: string;
+      mediaType?: PostMediaType;
+      mediaUrl?: string;
+      storyRefId?: string;
+    }
+  ): { ok: true; message: DirectMessage } | { ok: false; statusCode: number; error: string } {
+    if (senderId === recipientId) {
+      return { ok: false, statusCode: 400, error: 'You cannot send a direct message to yourself.' };
+    }
+    const recipient = this.resolveProfileRecord(recipientId);
+    if (!recipient) {
+      return { ok: false, statusCode: 404, error: 'Recipient profile not found.' };
+    }
+
+    const text = (input.text || '').trim().slice(0, 2000);
+    const mediaUrl = input.mediaUrl?.trim();
+    const mediaType = input.mediaType;
+
+    if (!text && !mediaUrl) {
+      return { ok: false, statusCode: 400, error: 'Enter a message or attach a photo/video.' };
+    }
+
+    if (mediaUrl) {
+      if (mediaType !== 'image' && mediaType !== 'video') {
+        return { ok: false, statusCode: 400, error: 'Attachment media type must be image or video.' };
+      }
+      if (!this.isSafeMediaUrl(mediaUrl, false)) {
+        return { ok: false, statusCode: 400, error: 'Invalid media attachment URL.' };
+      }
+    }
+
+    this.resolveProfileRecord(senderId);
+
+    const record: StoredDirectMessage = {
+      id: `dm-${crypto.randomUUID()}`,
+      conversationId: buildConversationId(senderId, recipientId),
+      senderId,
+      recipientId,
+      text,
+      mediaType: mediaUrl ? mediaType : undefined,
+      mediaUrl: mediaUrl || undefined,
+      storyRefId: input.storyRefId?.trim() || undefined,
+      createdAt: new Date().toISOString(),
+      readAt: null,
+    };
+
+    this.data.messages.push(record);
+    if (this.data.messages.length > 5000) {
+      this.data.messages = this.data.messages.slice(-5000);
+    }
+    this.persist();
+    return { ok: true, message: { ...record } };
   }
 }
 
